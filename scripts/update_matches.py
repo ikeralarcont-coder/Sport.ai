@@ -191,7 +191,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/9.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/11.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -751,6 +751,299 @@ def recover_pending_results(matches, rows, default_source, today_ec):
     return recovered, unresolved, skipped_not_stale
 
 
+
+def _http_json(url):
+    """Small browser-like JSON fetcher used by V11 fixture discovery."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/11.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.sofascore.com/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _event_tournament(event):
+    t = event.get("tournament") or {}
+    u = t.get("uniqueTournament") or event.get("uniqueTournament") or {}
+    return canonical_tournament(
+        u.get("name") or t.get("name") or "ATP Tournament"
+    )
+
+
+def _event_round(event):
+    info = event.get("roundInfo") or {}
+    raw = info.get("name") or info.get("round") or ""
+    s = str(raw).strip()
+    aliases = {
+        "round of 128": "R128",
+        "round of 64": "R64",
+        "round of 32": "R32",
+        "round of 16": "R16",
+        "quarterfinal": "QF",
+        "quarterfinals": "QF",
+        "quarter-final": "QF",
+        "quarter-finals": "QF",
+        "semifinal": "SF",
+        "semifinals": "SF",
+        "semi-final": "SF",
+        "semi-finals": "SF",
+        "final": "F",
+    }
+    return aliases.get(norm(s), s.upper())
+
+
+def _event_ec_datetime(event):
+    ts = event.get("startTimestamp")
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(ECUADOR_TZ)
+    except Exception:
+        return None
+
+
+def _looks_like_atp_singles(event):
+    """Keep ATP men's singles; reject WTA, doubles, ITF women, etc."""
+    home = ((event.get("homeTeam") or {}).get("name") or "").strip()
+    away = ((event.get("awayTeam") or {}).get("name") or "").strip()
+    if not home or not away or is_placeholder(home) or is_placeholder(away):
+        return False
+
+    t = event.get("tournament") or {}
+    u = t.get("uniqueTournament") or event.get("uniqueTournament") or {}
+    category = t.get("category") or u.get("category") or {}
+    hay = " ".join(
+        str(x or "") for x in [
+            t.get("name"), t.get("slug"),
+            u.get("name"), u.get("slug"),
+            category.get("name"), category.get("slug"),
+        ]
+    )
+    n = norm(hay)
+
+    if any(x in n for x in ("wta", "women", "woman", "doubles", "double", "mixed")):
+        return False
+
+    # Prefer explicit ATP labeling. Grand Slams may be labeled without "ATP",
+    # so known men's majors are accepted too.
+    if "atp" in n:
+        return True
+    if any(x in n for x in ("us open", "wimbledon", "roland garros", "australian open")):
+        return True
+    return False
+
+
+def fetch_tennis_events_for_date(day):
+    """
+    Fetch all tennis events for one date.
+
+    Tennis schedules are paginated/grouped by scheduled-tournaments on the
+    current endpoint. A legacy scheduled-events endpoint is retained as a
+    fallback because provider behavior can vary.
+    """
+    events = []
+    diagnostics = []
+
+    # Preferred tennis-specific endpoint, paginated.
+    for page in range(1, 12):
+        url = (
+            "https://www.sofascore.com/api/v1/sport/tennis/"
+            f"scheduled-tournaments/{day.isoformat()}/page/{page}"
+        )
+        try:
+            payload = _http_json(url)
+            diagnostics.append(f"OK::{url}")
+
+            # Different responses observed in the wild: tournaments may carry
+            # nested events, while some mirrors expose a flat events array.
+            page_events = list(payload.get("events") or [])
+            for block in payload.get("scheduledTournaments") or payload.get("tournaments") or []:
+                page_events.extend(block.get("events") or [])
+
+            events.extend(page_events)
+
+            has_next = payload.get("hasNextPage")
+            if has_next is False:
+                break
+            if not page_events and page > 1:
+                break
+        except Exception as e:
+            diagnostics.append(f"ERROR::{url}::{type(e).__name__}: {e}")
+            break
+
+    # Legacy fallback if the preferred endpoint yielded no events.
+    if not events:
+        for host in ("https://www.sofascore.com/api/v1", "https://api.sofascore.com/api/v1"):
+            url = f"{host}/sport/tennis/scheduled-events/{day.isoformat()}"
+            try:
+                payload = _http_json(url)
+                diagnostics.append(f"OK::{url}")
+                events.extend(payload.get("events") or [])
+                if events:
+                    break
+            except Exception as e:
+                diagnostics.append(f"ERROR::{url}::{type(e).__name__}: {e}")
+
+    # Event-id dedupe.
+    unique = {}
+    anonymous = []
+    for e in events:
+        eid = e.get("id")
+        if eid is None:
+            anonymous.append(e)
+        else:
+            unique[eid] = e
+    return list(unique.values()) + anonymous, diagnostics
+
+
+def fixture_existing_index(event, matches):
+    home = ((event.get("homeTeam") or {}).get("name") or "").strip()
+    away = ((event.get("awayTeam") or {}).get("name") or "").strip()
+    tourney = _event_tournament(event)
+    dt_ec = _event_ec_datetime(event)
+    target_date = dt_ec.date() if dt_ec else None
+
+    best_idx = None
+    best_score = 0.0
+
+    for idx, m in enumerate(matches):
+        ps = pair_similarity(home, away, m.get("player_a"), m.get("player_b"))
+        if ps < 0.90:
+            continue
+
+        ts = tournament_similarity(tourney, m.get("tournament"))
+        md = parse_iso_date(m.get("date"))
+        date_score = 0.5
+        if target_date and md:
+            delta = abs((target_date - md).days)
+            if delta == 0:
+                date_score = 1.0
+            elif delta == 1:
+                date_score = 0.90
+            elif delta <= 3:
+                date_score = 0.70
+            else:
+                date_score = 0.10
+
+        score = 0.78 * ps + 0.14 * ts + 0.08 * date_score
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_idx is not None and best_score >= 0.90:
+        return best_idx, round(best_score, 4)
+    return None, 0.0
+
+
+def fixture_card_from_event(event):
+    home = ((event.get("homeTeam") or {}).get("name") or "").strip()
+    away = ((event.get("awayTeam") or {}).get("name") or "").strip()
+    dt_ec = _event_ec_datetime(event)
+    event_id = event.get("id")
+    status_type = norm((event.get("status") or {}).get("type"))
+
+    status = "scheduled"
+    if status_type in {"inprogress", "live"}:
+        status = "live"
+    elif status_type in {"finished", "ended"}:
+        status = "finished"
+
+    date_str = dt_ec.date().isoformat() if dt_ec else datetime.now(ECUADOR_TZ).date().isoformat()
+    time_str = dt_ec.strftime("%H:%M") if dt_ec else None
+
+    m = {
+        "match_id": f"SOFA-{event_id}" if event_id is not None else (
+            "SOFA-" + "-".join(norm(x).replace(" ", "-") for x in [date_str, home, away])
+        ),
+        "date": date_str,
+        "time": time_str,
+        "time_ecuador": time_str,
+        "timezone": "America/Guayaquil",
+        "tournament": _event_tournament(event),
+        "tournament_level": "ATP",
+        "surface": "Unknown",
+        "round": _event_round(event),
+        "player_a": home,
+        "player_b": away,
+        "event_type": "Singles",
+        "status": status,
+        "source": "Sofascore fixture discovery",
+        "fixture_source_url": (
+            f"https://www.sofascore.com/api/v1/event/{event_id}"
+            if event_id is not None else None
+        ),
+        "fixture_event_id": event_id,
+        "fixture_discovered_automatically": True,
+        "fixture_discovered_at": datetime.now(timezone.utc).isoformat(),
+        # We do not fabricate model confidence for newly discovered cards.
+        # The UI can show them immediately, while a separate prediction stage
+        # can enrich these fields later.
+        "prediction_status": "awaiting_prediction",
+        "player_a_probability": 0.5,
+        "player_b_probability": 0.5,
+    }
+    return m
+
+
+def discover_scheduled_fixtures(matches, today_ec):
+    """
+    V11: add all discoverable ATP singles fixtures for today and tomorrow.
+
+    Existing cards are enriched with event id / Ecuador time rather than
+    duplicated. Finished events are not created here; result ingestion remains
+    the responsibility of the result pipeline.
+    """
+    added = 0
+    enriched = 0
+    seen_events = 0
+    diagnostics = []
+
+    for day in (today_ec, today_ec + timedelta(days=1)):
+        events, diag = fetch_tennis_events_for_date(day)
+        diagnostics.extend(diag)
+
+        for event in events:
+            if not _looks_like_atp_singles(event):
+                continue
+
+            seen_events += 1
+            status_type = norm((event.get("status") or {}).get("type"))
+            if status_type in {"finished", "ended"}:
+                continue
+
+            idx, score = fixture_existing_index(event, matches)
+            card = fixture_card_from_event(event)
+
+            if idx is not None:
+                existing = matches[idx]
+                # Preserve all model-generated analysis/probabilities. Only add
+                # authoritative scheduling metadata.
+                for field in (
+                    "fixture_event_id", "fixture_source_url",
+                    "fixture_discovered_automatically", "fixture_discovered_at",
+                    "time", "time_ecuador", "timezone"
+                ):
+                    if card.get(field) is not None:
+                        existing[field] = card[field]
+
+                if not existing.get("round") and card.get("round"):
+                    existing["round"] = card["round"]
+                if str(existing.get("status") or "").lower() in {"scheduled", "upcoming", "pre"}:
+                    existing["status"] = card["status"]
+                existing["fixture_match_score"] = score
+                enriched += 1
+                continue
+
+            matches.append(card)
+            added += 1
+
+    return added, enriched, seen_events, list(dict.fromkeys(diagnostics))
+
 def sofascore_rows_for_match(match, today_ec):
     """
     V9 fallback: query daily tennis event feeds around the card date.
@@ -775,12 +1068,12 @@ def sofascore_rows_for_match(match, today_ec):
         if d > today_ec:
             continue
 
-        url = f"https://www.sofascore.com/api/v1/sport/tennis/scheduled-events/{d.isoformat()}"
+        url = f"https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{d.isoformat()}"
         try:
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 SportsAI/9.0",
+                    "User-Agent": "Mozilla/5.0 SportsAI/11.0",
                     "Accept": "application/json",
                 },
             )
@@ -850,8 +1143,8 @@ def sofascore_rows_for_match(match, today_ec):
                     "_source_kind": "sofascore_v9",
                 })
 
-        except Exception:
-            # Fallback failure must never break the normal GitHub Action.
+        except Exception as e:
+            used.append(f"ERROR::{url}::{type(e).__name__}: {e}")
             continue
 
     return rows, used
@@ -915,11 +1208,11 @@ def recover_pending_with_live_fallback(matches, unresolved, today_ec):
                 match,
                 best_row,
                 best_row.get("_source_url") or "Sofascore daily tennis feed",
-                "pending_recovery_v9_live_fallback",
+                "pending_recovery_v11_live_fallback",
             )
             match["result_match_score"] = round(best_score, 4)
             match["recovered_from_pending"] = True
-            match["recovery_version"] = "V9"
+            match["recovery_version"] = "V11"
             match.pop("sync_warning", None)
             recovered += 1
         else:
@@ -980,6 +1273,12 @@ def main():
     rows, source_urls = download_rows()
     source_url = source_urls[0] if source_urls else "unknown"
     today_ec = datetime.now(ECUADOR_TZ).date()
+
+    # V11 fixture discovery: populate today's/tomorrow's ATP singles schedule
+    # before normal result synchronization.
+    fixture_added, fixture_enriched, fixture_seen, fixture_diagnostics = discover_scheduled_fixtures(
+        matches, today_ec
+    )
 
     # 0) Normalize and remove all TBD/TBD cards.
     cleaned = []
@@ -1147,6 +1446,9 @@ def main():
         encoding="utf-8",
     )
 
+    print(f"V11 ATP fixture events seen today/tomorrow: {fixture_seen}")
+    print(f"V11 scheduled fixtures added: {fixture_added}")
+    print(f"V11 existing cards enriched with fixture time/id: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -1156,11 +1458,11 @@ def main():
     print(f"Discovered {discovered} truly new ATP results.")
     print(f"Marked {pending_marked} stale scheduled matches as pending_result.")
     print(f"Recovered {recovered_pending} pending/stale matches with V8 CSV resolver.")
-    print(f"Recovered {recovered_v9} additional pending/stale matches with V9 live fallback.")
+    print(f"Recovered {recovered_v9} additional pending/stale matches with V11 live fallback.")
     print(f"Skipped {skipped_not_stale} scheduled matches that are today/future (not stale).")
     print(f"Removed/merged {recovery_dupes} result-only duplicates after recovery.")
     print(f"Unmatched stale/non-finished tracked cards before recovery: {unmatched_old}")
-    print(f"Still unresolved after V9 recovery: {len(unresolved_pending)}")
+    print(f"Still unresolved after V11 recovery: {len(unresolved_pending)}")
 
     if unresolved_pending:
         print("----- UNRESOLVED MATCHES -----")
@@ -1191,9 +1493,13 @@ def main():
     for loaded_source in source_urls:
         print(f" - {loaded_source}")
     if v9_sources:
-        print("V9 fallback sources queried:")
+        print("V11 result-fallback diagnostics:")
         for loaded_source in v9_sources:
             print(f" - {loaded_source}")
+
+    print("V11 fixture-discovery diagnostics:")
+    for diagnostic in fixture_diagnostics:
+        print(f" - {diagnostic}")
 
 
 if __name__ == "__main__":
