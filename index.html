@@ -32,6 +32,10 @@ main{max-width:900px;margin:auto;padding:22px 20px 60px}.hero{display:flex;justi
 .liveDot{width:7px;height:7px;border-radius:50%;background:#ff4d4d;display:inline-block;animation:pulse 1.2s infinite}
 .gameScore{font-weight:800;color:#ff8383}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+.badge.interrupted{background:#3a2d10;color:#ffd15c}
+.match.interrupted{border-color:#6e5620}
+.interruptedLine{margin-top:7px;font-size:12px;color:#ffd15c;font-weight:800}
 </style></head><body>
 <header><div class="nav"><div class="logo">SPORTS <i>AI</i> · TENNIS</div><div class="tag">AUTO · cada 10 min</div></div></header>
 <main><section class="hero"><div><h1>Entiende el partido,<br>no solo el porcentaje.</h1></div><p>Predicción, matchup, forma, torneo, fatiga, presión y señales que contradicen al favorito. Cada resultado queda auditado.</p></section>
@@ -63,6 +67,7 @@ async function boot(){
 }
 function state(m){
   if(m.status==='finished') return 'final';
+  if(['interrupted','suspended','delayed','postponed'].includes(m.status)) return 'interrupted';
   if(m.status==='live') return 'live';
   if(m.status==='pending_result') return 'pending';
   return 'next';
@@ -89,7 +94,7 @@ function render(){
     const dateOK=(filter==='pending'||filter==='final'||filter==='all')
       ? true
       : String(m.date||'').slice(0,10)===selectedDay;
-    const stateOK=filter==='all'||state(m)===filter;
+    const st=state(m); const stateOK=filter==='all'||st===filter||(filter==='live'&&st==='interrupted');
     return dateOK&&stateOK;
   });
 
@@ -107,7 +112,7 @@ function render(){
 
   Object.values(groups).forEach(ms=>{
     ms.sort((a,b)=>{
-      const rank=x=>x.status==='live'?0:x.status==='scheduled'?1:x.status==='finished'?2:3;
+      const rank=x=>x.status==='live'?0:['interrupted','suspended','delayed','postponed'].includes(x.status)?1:x.status==='scheduled'?2:x.status==='finished'?3:4;
       const sr=rank(a)-rank(b);
       if(sr!==0) return sr;
       const ta=String(a.time_ecuador||a.source_time||'99:99');
@@ -125,13 +130,13 @@ function render(){
 
 function card(m){
   let s=state(m),st=m.live_state,pa=m.player_a_probability??.5,pb=m.player_b_probability??.5;
-  let badge=s==='final'?'FINAL':s==='live'?'EN VIVO':s==='pending'?'PENDIENTE':'PRÓXIMO';
+  let badge=s==='final'?'FINAL':s==='live'?'EN VIVO':s==='interrupted'?'INTERRUMPIDO':s==='pending'?'PENDIENTE':'PRÓXIMO';
 
   let provisional=m.prediction_status==='provisional_v13';
   let awaiting=m.prediction_status==='awaiting_prediction';
 
   let nums;
-  if(s==='final'||s==='live'){
+  if(['final','live','interrupted'].includes(s)){
     nums=[st?.set_score?.[0]??'',st?.set_score?.[1]??''];
   }else if(awaiting){
     nums=['—','—'];
@@ -139,27 +144,31 @@ function card(m){
     nums=[pct(pa),pct(pb)];
   }
 
-  let liveGame='';
+  let statusLine='';
   if(s==='live'){
     const ga=st?.current_game?.player_a;
     const gb=st?.current_game?.player_b;
     const game=(ga!=null||gb!=null)?` · <span class="gameScore">Game ${ga??'-'}-${gb??'-'}</span>`:'';
-    liveGame=`<div class="liveScore"><span class="liveDot"></span>EN VIVO${game}</div>`;
+    statusLine=`<div class="liveScore"><span class="liveDot"></span>EN VIVO${game}</div>`;
+  }else if(s==='interrupted'){
+    statusLine=`<div class="interruptedLine">⏸ ${m.interruption_reason||st?.stage||'Partido temporalmente interrumpido'}</div>`;
   }
 
   let hint=s==='final'
     ? (st?.sets||[]).map(x=>x.a+'-'+x.b).join(' · ')+' · '+(st?.winner||'')
     : s==='live'
       ? `Sets ${st?.set_score?.[0]??'-'}-${st?.set_score?.[1]??'-'} · actualizado ${st?.synced_at?new Date(st.synced_at).toLocaleTimeString('es-EC',{hour:'2-digit',minute:'2-digit'}):''}`
-      : s==='pending'
-        ? `${m.date} · Resultado pendiente de sincronizar`
-        : `${m.date}${m.time_ecuador?' · '+m.time_ecuador+' EC':''} · ${m.surface||''}${provisional?' · análisis provisional':''}`;
+      : s==='interrupted'
+        ? `Último marcador: ${st?.set_score?.[0]??'-'}-${st?.set_score?.[1]??'-'} · se mantiene visible hasta reanudación`
+        : s==='pending'
+          ? `${m.date} · Resultado pendiente de sincronizar`
+          : `${m.date}${m.time_ecuador?' · '+m.time_ecuador+' EC':''} · ${m.surface||''}${provisional?' · análisis provisional':''}`;
 
   return `<article class="match ${s}" onclick="openM('${m.match_id}')">
     <div class="meta">${m.tournament||''} · ${m.round||''}<span class="badge ${s}">${badge}</span></div>
     <div class="row"><span class="name">${m.player_a}</span><span class="num">${nums[0]}</span></div>
     <div class="row"><span class="name">${m.player_b}</span><span class="num">${nums[1]}</span></div>
-    ${liveGame}
+    ${statusLine}
     ${s==='next'&&!awaiting?`<div class="bar"><span style="width:${pa*100}%"></span><span style="width:${pb*100}%"></span></div>`:''}
     <div class="hint">${hint}</div>
   </article>`
