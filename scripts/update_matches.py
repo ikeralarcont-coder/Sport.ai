@@ -2555,7 +2555,6 @@ def merge_flashscore_feed(matches, rows, today_ec):
     No fixed expected daily match count.
     """
     events, diagnostics = fetch_flashscore_atp_feed()
-    v23_state = load_flashscore_state()
 
     # Resolve provider abbreviations before identity matching/card creation.
     _known_names = historical_player_names(rows)
