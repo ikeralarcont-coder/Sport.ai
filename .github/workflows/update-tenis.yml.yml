@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Update completed matches
+      - name: Update tennis matches
         run: python scripts/update_matches.py
 
       - name: Commit and push safely
@@ -44,12 +44,21 @@ jobs:
           git config user.name "sports-ai-bot"
           git config user.email "sports-ai-bot@users.noreply.github.com"
 
+          # Guardamos temporalmente el resultado generado
+          cp matches.json /tmp/matches-updated.json
+
+          # Nos sincronizamos con la versión más reciente de main
+          git fetch origin main
+          git reset --hard origin/main
+
+          # Ejecutamos de nuevo el actualizador sobre el main más reciente
+          python scripts/update_matches.py
+
+          if git diff --quiet -- matches.json; then
+            echo "Repository already contains the latest tennis data."
+            exit 0
+          fi
+
           git add matches.json
           git commit -m "Auto-update tennis results"
-
-          # The repository may receive another commit while this workflow runs.
-          # Rebase our generated matches.json update on top of the newest main.
-          git fetch origin main
-          git rebase origin/main
-
           git push origin HEAD:main
