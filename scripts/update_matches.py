@@ -191,7 +191,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/12.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/13.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -850,7 +850,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/12.0"},
+            headers={"User-Agent": "SportsAI/13.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -866,6 +866,374 @@ def download_github_fixture_feed():
         )
         return {}, diagnostics
 
+
+
+def _safe_mean(values, default=None):
+    vals = [float(v) for v in values if v is not None]
+    return sum(vals) / len(vals) if vals else default
+
+
+def _player_match_view(row, player_name):
+    """
+    Return one player's perspective from a winner/loser ATP result row.
+    """
+    w = row.get("winner_name")
+    l = row.get("loser_name")
+    sw = player_similarity(player_name, w)
+    sl = player_similarity(player_name, l)
+
+    if max(sw, sl) < 0.88:
+        return None
+
+    won = sw >= sl
+    prefix = "w_" if won else "l_"
+    opp_prefix = "l_" if won else "w_"
+
+    svpt = as_float(row.get(prefix + "svpt"))
+    first_in = as_float(row.get(prefix + "1stIn"))
+    first_won = as_float(row.get(prefix + "1stWon"))
+    second_won = as_float(row.get(prefix + "2ndWon"))
+    bp_saved = as_float(row.get(prefix + "bpSaved"))
+    bp_faced = as_float(row.get(prefix + "bpFaced"))
+
+    opp_svpt = as_float(row.get(opp_prefix + "svpt"))
+    opp_first_won = as_float(row.get(opp_prefix + "1stWon"))
+    opp_second_won = as_float(row.get(opp_prefix + "2ndWon"))
+
+    second_attempts = None
+    if svpt is not None and first_in is not None:
+        second_attempts = max(0.0, svpt - first_in)
+
+    return {
+        "won": won,
+        "date": row_date_obj(row),
+        "tournament": tournament_name(row),
+        "surface": str(row.get("surface") or ""),
+        "rank": as_float(row.get(prefix + "rank")),
+        "age": as_float(row.get(prefix + "age")),
+        "minutes": as_float(row.get("minutes")),
+        "aces": as_float(row.get(prefix + "ace")),
+        "dfs": as_float(row.get(prefix + "df")),
+        "svpt": svpt,
+        "first_in": first_in,
+        "first_won": first_won,
+        "second_won": second_won,
+        "second_attempts": second_attempts,
+        "bp_saved": bp_saved,
+        "bp_faced": bp_faced,
+        "opp_svpt": opp_svpt,
+        "opp_points_won": (
+            (opp_first_won or 0) + (opp_second_won or 0)
+            if opp_svpt is not None else None
+        ),
+    }
+
+
+def infer_surface_for_tournament(tournament, rows):
+    exact = []
+    fuzzy = []
+    for row in rows:
+        s = str(row.get("surface") or "").strip()
+        if not s:
+            continue
+        ts = tournament_similarity(tournament, tournament_name(row))
+        if ts >= 0.90:
+            exact.append(s)
+        elif ts >= 0.72:
+            fuzzy.append(s)
+
+    source = exact or fuzzy
+    if source:
+        counts = {}
+        for s in source:
+            counts[s] = counts.get(s, 0) + 1
+        return max(counts, key=counts.get)
+
+    # Stable fallback for major ATP events when source naming differs.
+    n = norm(tournament)
+    if any(x in n for x in ("cincinnati", "us open", "miami", "indian wells",
+                             "canada", "toronto", "montreal", "shanghai")):
+        return "Hard"
+    if any(x in n for x in ("roland garros", "rome", "madrid", "monte carlo")):
+        return "Clay"
+    if "wimbledon" in n:
+        return "Grass"
+    return "Unknown"
+
+
+def build_player_profile(player_name, tournament, surface, rows, as_of):
+    views = []
+    for row in rows:
+        v = _player_match_view(row, player_name)
+        if v and v["date"] and v["date"] <= as_of:
+            views.append(v)
+
+    views.sort(key=lambda x: x["date"], reverse=True)
+    recent = views[:20]
+    last10 = recent[:10]
+    last5 = recent[:5]
+
+    same_surface = [
+        v for v in recent
+        if norm(v.get("surface")) == norm(surface) and norm(surface) not in {"", "unknown"}
+    ][:10]
+
+    tourney = [
+        v for v in recent
+        if tournament_similarity(tournament, v.get("tournament")) >= 0.82
+    ]
+
+    def win_pct(items):
+        return sum(1 for x in items if x["won"]) / len(items) if items else None
+
+    latest = recent[0] if recent else {}
+    minutes_3d = sum(
+        (v.get("minutes") or 0) for v in recent
+        if v["date"] and 0 <= (as_of - v["date"]).days <= 3
+    )
+    minutes_7d = sum(
+        (v.get("minutes") or 0) for v in recent
+        if v["date"] and 0 <= (as_of - v["date"]).days <= 7
+    )
+
+    first_won_pct = _safe_mean([
+        (v["first_won"] / v["first_in"])
+        for v in tourney
+        if v.get("first_in") not in (None, 0) and v.get("first_won") is not None
+    ])
+    second_won_pct = _safe_mean([
+        (v["second_won"] / v["second_attempts"])
+        for v in tourney
+        if v.get("second_attempts") not in (None, 0) and v.get("second_won") is not None
+    ])
+    bp_save_pct = _safe_mean([
+        (v["bp_saved"] / v["bp_faced"])
+        for v in tourney
+        if v.get("bp_faced") not in (None, 0) and v.get("bp_saved") is not None
+    ])
+    return_won_pct = _safe_mean([
+        ((v["opp_svpt"] - v["opp_points_won"]) / v["opp_svpt"])
+        for v in tourney
+        if v.get("opp_svpt") not in (None, 0) and v.get("opp_points_won") is not None
+    ])
+
+    return {
+        "rank": latest.get("rank"),
+        "age": latest.get("age"),
+        "form5": win_pct(last5),
+        "form10": win_pct(last10),
+        "surface_form10": win_pct(same_surface),
+        "matches_sample": len(recent),
+        "fatigue_minutes_3d": round(minutes_3d, 1),
+        "fatigue_minutes_7d": round(minutes_7d, 1),
+        "fatigue_index": round(min(100, minutes_3d / 6 + minutes_7d / 20), 1),
+        "tournament": {
+            "matches": len(tourney),
+            "wins": sum(1 for x in tourney if x["won"]),
+            "win_pct": win_pct(tourney),
+            "first_serve_won_pct": first_won_pct,
+            "second_serve_won_pct": second_won_pct,
+            "bp_save_pct": bp_save_pct,
+            "return_points_won_pct": return_won_pct,
+            "aces_per_match": _safe_mean([v.get("aces") for v in tourney]),
+            "double_faults_per_match": _safe_mean([v.get("dfs") for v in tourney]),
+        },
+    }
+
+
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def provisional_probability(profile_a, profile_b):
+    """
+    Transparent V13 provisional model.
+
+    This is intentionally conservative and is marked provisional; it should
+    not be confused with the richer Phase 6 model used by pre-generated cards.
+    """
+    import math
+    score = 0.0
+    factors = []
+
+    ra, rb = profile_a.get("rank"), profile_b.get("rank")
+    if ra and rb and ra > 0 and rb > 0:
+        impact = 0.72 * math.log(rb / ra)
+        impact = _clamp(impact, -1.05, 1.05)
+        score += impact
+        factors.append(("Ranking", impact))
+
+    for label, key, weight in (
+        ("Forma últimos 10", "form10", 1.15),
+        ("Forma últimos 5", "form5", 0.75),
+        ("Forma en superficie", "surface_form10", 0.85),
+    ):
+        a, b = profile_a.get(key), profile_b.get(key)
+        if a is not None and b is not None:
+            impact = weight * (a - b)
+            score += impact
+            factors.append((label, impact))
+
+    # Fatigue: 100-minute differential over 72h is meaningful but not dominant.
+    fa = profile_a.get("fatigue_minutes_3d") or 0
+    fb = profile_b.get("fatigue_minutes_3d") or 0
+    fatigue_impact = _clamp((fb - fa) / 260.0, -0.50, 0.50)
+    score += fatigue_impact
+    factors.append(("Fatiga 72h", fatigue_impact))
+
+    # Very small age/prime adjustment. Age never overrides ranking/form.
+    aa, ab = profile_a.get("age"), profile_b.get("age")
+    if aa is not None and ab is not None:
+        def age_quality(age):
+            if 22 <= age <= 29:
+                return 1.0
+            if 19 <= age < 22 or 29 < age <= 32:
+                return 0.7
+            if 17 <= age < 19 or 32 < age <= 35:
+                return 0.35
+            return 0.1
+        age_impact = 0.20 * (age_quality(aa) - age_quality(ab))
+        score += age_impact
+        factors.append(("Edad / prime físico", age_impact))
+
+    p = 1.0 / (1.0 + math.exp(-score))
+    p = _clamp(p, 0.18, 0.82)
+    return p, factors
+
+
+def enrich_fixture_with_provisional_analysis(match, rows, today_ec):
+    if match.get("prediction_status") not in {"awaiting_prediction", "provisional_v13"}:
+        return False
+
+    surface = match.get("surface")
+    if not surface or norm(surface) == "unknown":
+        surface = infer_surface_for_tournament(match.get("tournament"), rows)
+        match["surface"] = surface
+
+    a = build_player_profile(
+        match.get("player_a"), match.get("tournament"), surface, rows, today_ec
+    )
+    b = build_player_profile(
+        match.get("player_b"), match.get("tournament"), surface, rows, today_ec
+    )
+
+    # Require at least some history for both players. Otherwise keep awaiting.
+    if a["matches_sample"] == 0 or b["matches_sample"] == 0:
+        return False
+
+    pa, factors = provisional_probability(a, b)
+    pb = 1 - pa
+
+    match["player_a_probability"] = round(pa, 6)
+    match["player_b_probability"] = round(pb, 6)
+    match["favorite"] = match["player_a"] if pa >= pb else match["player_b"]
+    match["favorite_probability"] = round(max(pa, pb), 6)
+    match["prediction_status"] = "provisional_v13"
+    match["model_name"] = "V13 provisional fixture model"
+
+    match["tournament_performance"] = {
+        "player_a": a["tournament"],
+        "player_b": b["tournament"],
+    }
+
+    match["analysis"] = {
+        "component_probabilities_player_a": {
+            "provisional_v13": round(pa, 6),
+        },
+        "phase6": {
+            "player_a_workload": {
+                "fatigue_index": a["fatigue_index"],
+                "fatigue_minutes_3d": a["fatigue_minutes_3d"],
+                "fatigue_minutes_7d": a["fatigue_minutes_7d"],
+            },
+            "player_b_workload": {
+                "fatigue_index": b["fatigue_index"],
+                "fatigue_minutes_3d": b["fatigue_minutes_3d"],
+                "fatigue_minutes_7d": b["fatigue_minutes_7d"],
+            },
+            "player_a_tournament": a["tournament"],
+            "player_b_tournament": b["tournament"],
+        },
+        "player_a_snapshot": {
+            "rank": a["rank"], "age": a["age"],
+            "form5": a["form5"], "form10": a["form10"],
+            "surface_form10": a["surface_form10"],
+        },
+        "player_b_snapshot": {
+            "rank": b["rank"], "age": b["age"],
+            "form5": b["form5"], "form10": b["form10"],
+            "surface_form10": b["surface_form10"],
+        },
+        "factor_impacts": [
+            {
+                "factor": label,
+                "impact_on_player_a": round(impact, 4),
+                "direction": (
+                    "player_a" if impact > 0.02
+                    else "player_b" if impact < -0.02
+                    else "neutral"
+                ),
+            }
+            for label, impact in factors
+        ],
+    }
+
+    strongest_a = sorted(
+        [(label, imp) for label, imp in factors if imp > 0.03],
+        key=lambda x: x[1], reverse=True
+    )[:2]
+    strongest_b = sorted(
+        [(label, -imp) for label, imp in factors if imp < -0.03],
+        key=lambda x: x[1], reverse=True
+    )[:2]
+
+    fav = match["favorite"]
+    other = match["player_b"] if fav == match["player_a"] else match["player_a"]
+    edge = abs(pa - pb) * 100
+
+    reasons = []
+    if strongest_a:
+        reasons.append(
+            f"{match['player_a']} recibe apoyo principalmente de " +
+            ", ".join(x[0].lower() for x in strongest_a) + "."
+        )
+    if strongest_b:
+        reasons.append(
+            f"{match['player_b']} responde mejor en " +
+            ", ".join(x[0].lower() for x in strongest_b) + "."
+        )
+    if not reasons:
+        reasons.append("Los indicadores disponibles están bastante equilibrados.")
+
+    match["written_analysis"] = {
+        "summary": (
+            f"Análisis provisional automático: {fav} parte con una ventaja de "
+            f"{edge:.1f} puntos porcentuales sobre {other}. "
+            "La estimación usa ranking disponible, forma reciente, rendimiento "
+            "en la superficie y carga física; se recalculará si llegan datos más completos."
+        ),
+        "reasons": " ".join(reasons),
+    }
+
+    match["provisional_generated_at"] = datetime.now(timezone.utc).isoformat()
+    return True
+
+
+def enrich_all_provisional_fixtures(matches, rows, today_ec):
+    enriched = 0
+    pending = 0
+    for m in matches:
+        status = str(m.get("status") or "").lower()
+        if status not in {"scheduled", "upcoming", "pre", "live"}:
+            continue
+        if m.get("prediction_status") not in {"awaiting_prediction", "provisional_v13"}:
+            continue
+
+        if enrich_fixture_with_provisional_analysis(m, rows, today_ec):
+            enriched += 1
+        else:
+            pending += 1
+    return enriched, pending
 
 def github_fixture_card(item, today_ec, known_names):
     tournament = canonical_tournament(item.get("tournament") or "ATP Tournament")
@@ -1002,7 +1370,7 @@ def _http_json(url):
         url,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/12.0",
+                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/13.0",
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://www.sofascore.com/",
         },
@@ -1317,7 +1685,7 @@ def sofascore_rows_for_match(match, today_ec):
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 SportsAI/12.0",
+                    "User-Agent": "Mozilla/5.0 SportsAI/13.0",
                     "Accept": "application/json",
                 },
             )
@@ -1530,6 +1898,12 @@ def main():
         matches, today_ec
     )
 
+    # V13: automatically analyze newly discovered fixtures using the ATP
+    # historical/result rows already loaded by the updater.
+    provisional_enriched, provisional_pending = enrich_all_provisional_fixtures(
+        matches, rows, today_ec
+    )
+
     # 0) Normalize and remove all TBD/TBD cards.
     cleaned = []
     removed_placeholders = 0
@@ -1696,6 +2070,8 @@ def main():
         encoding="utf-8",
     )
 
+    print(f"V13 newly discovered fixtures analyzed provisionally: {provisional_enriched}")
+    print(f"V13 fixtures still awaiting sufficient player data: {provisional_pending}")
     print(f"V12 GitHub top-level ATP fixtures eligible today: {gh_fixture_eligible}")
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
