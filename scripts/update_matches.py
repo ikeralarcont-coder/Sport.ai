@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
 import unicodedata
 import urllib.request
@@ -196,7 +197,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/22.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/23.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -898,7 +899,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/22.0"},
+            headers={"User-Agent": "SportsAI/23.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -2554,6 +2555,7 @@ def merge_flashscore_feed(matches, rows, today_ec):
     No fixed expected daily match count.
     """
     events, diagnostics = fetch_flashscore_atp_feed()
+    v23_state = load_flashscore_state()
 
     # Resolve provider abbreviations before identity matching/card creation.
     _known_names = historical_player_names(rows)
@@ -2613,7 +2615,120 @@ def merge_flashscore_feed(matches, rows, today_ec):
         "live_updated": live_updated,
         "finished_updated": finished_updated,
         "diagnostics": diagnostics,
+        "raw_events": [
+            {
+                "event_id": e.get("event_id"),
+                "date": e.get("date_ec").isoformat() if hasattr(e.get("date_ec"), "isoformat") else str(e.get("date_ec") or ""),
+                "player_a": e.get("player_a"),
+                "player_b": e.get("player_b"),
+                "AB": e.get("status_code"),
+                "stage": e.get("status_stage"),
+                "score": [e.get("score_a"), e.get("score_b")],
+                "game": [e.get("game_a"), e.get("game_b")],
+            }
+            for e in events
+        ],
     }
+
+
+CLOUDFLARE_LIVE_UPDATE_URL = "https://sports-ai-live.ruth198027.workers.dev/update"
+
+
+def push_live_snapshot_to_cloudflare(matches, today_ec):
+    """Send today's ATP scoreboard snapshot to the Cloudflare Worker.
+
+    Includes scheduled, live, interrupted/delayed and finished matches so /live
+    can render the complete day. Authentication comes from the GitHub Actions
+    environment variable CLOUDFLARE_UPDATE_TOKEN.
+    """
+    token = os.environ.get("CLOUDFLARE_UPDATE_TOKEN", "").strip()
+    if not token:
+        print("V24 Cloudflare live push skipped: CLOUDFLARE_UPDATE_TOKEN missing.")
+        return False
+
+    allowed_statuses = {
+        "scheduled", "upcoming", "pre", "live",
+        "interrupted", "suspended", "delayed", "postponed", "finished",
+    }
+
+    snapshot = []
+    seen = set()
+
+    for m in matches:
+        if parse_iso_date(m.get("date")) != today_ec:
+            continue
+
+        status = str(m.get("status") or "").lower()
+        if status not in allowed_statuses:
+            continue
+
+        pair = canonical_pair_key(m.get("player_a"), m.get("player_b"))
+        dedupe_key = (norm(canonical_tournament(m.get("tournament"))), pair)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        live = m.get("live_state") or {}
+        current_game = live.get("current_game")
+        set_score = live.get("set_score") or []
+
+        snapshot.append({
+            "id": m.get("flashscore_event_id") or m.get("match_id"),
+            "match_id": m.get("match_id"),
+            "date": m.get("date"),
+            "time": m.get("time_ecuador") or m.get("source_time") or m.get("time_label"),
+            "timezone": m.get("timezone") or "America/Guayaquil",
+            "tournament": m.get("tournament"),
+            "round": m.get("round"),
+            "surface": m.get("surface"),
+            "player_a": m.get("player_a"),
+            "player_b": m.get("player_b"),
+            "status": status,
+            "set_score": set_score,
+            "current_game": current_game,
+            "interrupted": bool(live.get("interrupted")) or status in {
+                "interrupted", "suspended", "delayed", "postponed"
+            },
+            "interruption_reason": m.get("interruption_reason"),
+            "winner": live.get("winner") or m.get("result_winner"),
+            "prediction": {
+                "player_a_probability": m.get("player_a_probability"),
+                "player_b_probability": m.get("player_b_probability"),
+                "favorite": m.get("favorite"),
+                "prediction_status": m.get("prediction_status"),
+            },
+            "flashscore_event_id": m.get("flashscore_event_id"),
+            "source": "Sports AI V24 / Flashscore",
+            "live_synced_at": live.get("synced_at") or m.get("flashscore_last_seen_at"),
+        })
+
+    snapshot.sort(key=lambda x: (
+        str(x.get("time") or "99:99"),
+        str(x.get("tournament") or ""),
+        str(x.get("player_a") or ""),
+    ))
+
+    payload = json.dumps({"matches": snapshot}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        CLOUDFLARE_LIVE_UPDATE_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "SportsAI-GitHubActions/24.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+        print(f"V24 Cloudflare live snapshot pushed: {len(snapshot)} matches.")
+        print(f"V24 Worker response: {response_body}")
+        return True
+    except Exception as exc:
+        print(f"V24 Cloudflare live push ERROR: {type(exc).__name__}: {exc}")
+        return False
 
 def main():
     matches = json.loads(MATCHES.read_text(encoding="utf-8"))
@@ -2816,13 +2931,13 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V22 NAME NORMALIZATION ===")
+    print("=== V23 NAME NORMALIZATION ===")
     print(f"Provider player names normalized: {v19_names_changed}")
     for _change in v19_name_changes:
         print(f" - {_change}")
     print("==============================")
 
-    print("=== V22 FLASHSCORE PERSISTENT LIVE FEED ===")
+    print("=== V23 FLASHSCORE STATE MEMORY FEED ===")
     print(f"Relevant ATP rows (D-2..D+1): {fs_stats['relevant']}")
     print(f"Cards added from Flashscore: {fs_stats['added']}")
     print(f"Existing cards enriched from Flashscore: {fs_stats['enriched']}")
@@ -2847,12 +2962,12 @@ def main():
     print("===========================")
 
     audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
-    print("=== V22 GITHUB SOURCE ROW AUDIT ===")
+    print("=== V23 GITHUB SOURCE ROW AUDIT ===")
     print(f"Raw top-level ATP rows: {len(audit_rows)}")
     for i, a in enumerate(audit_rows, 1):
         print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
     print("============================")
-    print("=== V22 MULTI-SOURCE ATP DISCOVERY ===")
+    print("=== V23 MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2875,8 +2990,8 @@ def main():
     _finished = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "finished")
 
     print(f"Final unique scheduled/live fixtures today: {len(v14_today_cards)}")
-    print(f"V22 total unique matches today (all statuses): {len(v18_today_all)}")
-    print(f"V22 status split: scheduled={_scheduled} | live={_live} | interrupted/delayed={_interrupted} | finished={_finished}")
+    print(f"V23 total unique matches today (all statuses): {len(v18_today_all)}")
+    print(f"V23 status split: scheduled={_scheduled} | live={_live} | interrupted/delayed={_interrupted} | finished={_finished}")
     for i, m in enumerate(v14_today_cards, 1):
         print(f"[TODAY {i}] {m.get('tournament')} | {m.get('player_a')} vs {m.get('player_b')} | status={m.get('status')} | prediction={m.get('prediction_status') or 'existing'}")
     if v14_alias_log:
@@ -2889,9 +3004,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V22 SofaScore events seen today/tomorrow: {fixture_seen}")
-    print(f"V22 SofaScore fixtures added: {fixture_added}")
-    print(f"V22 SofaScore cards enriched: {fixture_enriched}")
+    print(f"V23 SofaScore events seen today/tomorrow: {fixture_seen}")
+    print(f"V23 SofaScore fixtures added: {fixture_added}")
+    print(f"V23 SofaScore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2944,7 +3059,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V22 SofaScore diagnostics (non-blocking):")
+    print("V23 SofaScore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
