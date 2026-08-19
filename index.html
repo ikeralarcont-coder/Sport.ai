@@ -32,6 +32,8 @@ main{max-width:900px;margin:auto;padding:22px 20px 60px}.hero{display:flex;justi
 .liveDot{width:7px;height:7px;border-radius:50%;background:#ff4d4d;display:inline-block;animation:pulse 1.2s infinite}
 .gameScore{font-weight:800;color:#ff8383}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+.liveBoard{margin-top:10px;border-top:1px solid #ffffff12;padding-top:9px}.scoreGrid{display:grid;grid-template-columns:minmax(110px,1fr) repeat(5,28px) 44px;gap:5px;align-items:center;font-size:12px}.scoreGrid .sh{color:var(--mut);font-size:9px;text-align:center;font-weight:800}.scoreGrid .sn{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.scoreGrid .sv{text-align:center;font-weight:900}.scoreGrid .cur{color:var(--g)}.scoreGrid .pts{color:#ff8383}.setNow{margin-top:7px;color:var(--mut);font-size:11px}.setNow b{color:#fff}
+
 
 .badge.interrupted{background:#3a2d10;color:#ffd15c}
 .match.interrupted{border-color:#6e5620}
@@ -205,31 +207,37 @@ function render(){
   }).join('') || '<div class="empty">No hay partidos para esta fecha/filtro.</div>';
 }
 
+function liveBoard(m,st){
+  const sets=(st?.sets||[]).filter(x=>x&&x.a!=null&&x.b!=null);
+  const ga=st?.current_game?.player_a, gb=st?.current_game?.player_b;
+  if(!sets.length && ga==null && gb==null) return '';
+  const maxSets=Math.max(sets.length,1);
+  const heads=Array.from({length:5},(_,i)=>`<span class="sh">${i<maxSets?'S'+(i+1):''}</span>`).join('');
+  const vals=(who)=>Array.from({length:5},(_,i)=>{
+    const set=sets[i]; const v=set?.[who];
+    return `<span class="sv ${i===sets.length-1?'cur':''}">${v??''}</span>`;
+  }).join('');
+  const current=sets.length?sets[sets.length-1]:st?.current_set;
+  const setNo=Math.max(1,sets.length);
+  const gameLine=current&&current.a!=null&&current.b!=null
+    ? `<div class="setNow">Set ${setNo} en juegos: <b>${current.a}-${current.b}</b>${ga!=null||gb!=null?` · puntos <b>${ga??'-'}-${gb??'-'}</b>`:''}</div>`
+    : (ga!=null||gb!=null?`<div class="setNow">Puntos del game: <b>${ga??'-'}-${gb??'-'}</b></div>`:'');
+  return `<div class="liveBoard"><div class="scoreGrid"><span></span>${heads}<span class="sh">PTS</span><span class="sn">${m.player_a}</span>${vals('a')}<span class="sv pts">${ga??'-'}</span><span class="sn">${m.player_b}</span>${vals('b')}<span class="sv pts">${gb??'-'}</span></div>${gameLine}</div>`;
+}
+
 function card(m){
   let s=state(m),st=m.live_state,pa=m.player_a_probability??.5,pb=m.player_b_probability??.5;
   let badge=s==='final'?'FINAL':s==='live'?'EN VIVO':s==='interrupted'?'INTERRUMPIDO':s==='pending'?'PENDIENTE':'PRÓXIMO';
-
   let provisional=m.prediction_status==='provisional_v13';
   let awaiting=m.prediction_status==='awaiting_prediction';
-
   let nums;
-  if(['final','live','interrupted'].includes(s)){
-    nums=[st?.set_score?.[0]??'',st?.set_score?.[1]??''];
-  }else if(awaiting){
-    nums=['—','—'];
-  }else{
-    nums=[pct(pa),pct(pb)];
-  }
+  if(['final','live','interrupted'].includes(s)) nums=[st?.set_score?.[0]??'',st?.set_score?.[1]??''];
+  else if(awaiting) nums=['—','—'];
+  else nums=[pct(pa),pct(pb)];
 
   let statusLine='';
-  if(s==='live'){
-    const ga=st?.current_game?.player_a;
-    const gb=st?.current_game?.player_b;
-    const game=(ga!=null||gb!=null)?` · <span class="gameScore">Game ${ga??'-'}-${gb??'-'}</span>`:'';
-    statusLine=`<div class="liveScore"><span class="liveDot"></span>EN VIVO${game}</div>`;
-  }else if(s==='interrupted'){
-    statusLine=`<div class="interruptedLine">⏸ ${m.interruption_reason||st?.stage||'Partido temporalmente interrumpido'}</div>`;
-  }
+  if(s==='live') statusLine=`<div class="liveScore"><span class="liveDot"></span>EN VIVO</div>${liveBoard(m,st)}`;
+  else if(s==='interrupted') statusLine=`<div class="interruptedLine">⏸ ${m.interruption_reason||st?.stage||'Partido temporalmente interrumpido'}</div>${liveBoard(m,st)}`;
 
   let hint=s==='final'
     ? (st?.sets||[]).map(x=>x.a+'-'+x.b).join(' · ')+' · '+(st?.winner||'')
