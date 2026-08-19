@@ -191,7 +191,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/8.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/9.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -750,6 +750,186 @@ def recover_pending_results(matches, rows, default_source, today_ec):
 
     return recovered, unresolved, skipped_not_stale
 
+
+def sofascore_rows_for_match(match, today_ec):
+    """
+    V9 fallback: query daily tennis event feeds around the card date.
+
+    This is tournament-agnostic: it can recover ATP matches from Cincinnati,
+    US Open, Roland Garros, Wimbledon, or any other tournament present in the
+    daily tennis feed. It is only used for stale/pending cards that the CSV
+    sources could not resolve.
+    """
+    target_date = parse_iso_date(match.get("date"))
+    if target_date is None:
+        return [], []
+
+    # Match dates in historical CSVs are often tournament-start dates, while
+    # Sports AI cards normally store the actual match date. Search a compact
+    # window around the card to tolerate timezone/scheduling differences.
+    dates = [target_date + timedelta(days=offset) for offset in range(-2, 3)]
+    rows = []
+    used = []
+
+    for d in dates:
+        if d > today_ec:
+            continue
+
+        url = f"https://www.sofascore.com/api/v1/sport/tennis/scheduled-events/{d.isoformat()}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 SportsAI/9.0",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+            used.append(url)
+
+            for event in payload.get("events", []):
+                status_type = norm((event.get("status") or {}).get("type"))
+                winner_code = event.get("winnerCode")
+
+                # Only ingest completed events.
+                if status_type not in {"finished", "ended"} and winner_code not in {1, 2}:
+                    continue
+
+                home = ((event.get("homeTeam") or {}).get("name") or "").strip()
+                away = ((event.get("awayTeam") or {}).get("name") or "").strip()
+                if not home or not away:
+                    continue
+
+                if winner_code == 1:
+                    winner, loser = home, away
+                    winner_score = event.get("homeScore") or {}
+                    loser_score = event.get("awayScore") or {}
+                elif winner_code == 2:
+                    winner, loser = away, home
+                    winner_score = event.get("awayScore") or {}
+                    loser_score = event.get("homeScore") or {}
+                else:
+                    # A completed event without an explicit winner is not safe
+                    # enough to assign automatically.
+                    continue
+
+                tournament = (
+                    ((event.get("tournament") or {}).get("name"))
+                    or (((event.get("uniqueTournament") or {}).get("name")))
+                    or match.get("tournament")
+                    or "ATP Tournament"
+                )
+
+                round_name = (
+                    ((event.get("roundInfo") or {}).get("name"))
+                    or ((event.get("roundInfo") or {}).get("round"))
+                    or match.get("round")
+                    or ""
+                )
+
+                score_tokens = []
+                for n in range(1, 6):
+                    wk = f"period{n}"
+                    wv = winner_score.get(wk)
+                    lv = loser_score.get(wk)
+                    if wv is not None and lv is not None:
+                        score_tokens.append(f"{wv}-{lv}")
+
+                rows.append({
+                    "winner_name": winner,
+                    "loser_name": loser,
+                    "tourney_name": tournament,
+                    "round": str(round_name),
+                    "tourney_date": d.strftime("%Y%m%d"),
+                    "date": d.isoformat(),
+                    "surface": match.get("surface") or "",
+                    "score": " ".join(score_tokens),
+                    "_source_url": url,
+                    "_source_kind": "sofascore_v9",
+                })
+
+        except Exception:
+            # Fallback failure must never break the normal GitHub Action.
+            continue
+
+    return rows, used
+
+
+def recover_pending_with_live_fallback(matches, unresolved, today_ec):
+    """
+    V9 second-stage recovery for cards left unresolved by the CSV resolver.
+
+    Requires both player identities to match strongly. Tournament/round are
+    supporting signals, not hard blockers, because providers name tournaments
+    and rounds differently.
+    """
+    if not unresolved:
+        return 0, unresolved, []
+
+    by_id = {m.get("match_id"): m for m in matches}
+    recovered = 0
+    still_unresolved = []
+    fallback_sources = []
+
+    for item in unresolved:
+        match = by_id.get(item.get("match_id"))
+        if match is None:
+            still_unresolved.append(item)
+            continue
+
+        rows, used = sofascore_rows_for_match(match, today_ec)
+        fallback_sources.extend(used)
+
+        best_row = None
+        best_score = 0.0
+
+        for row in rows:
+            oriented = oriented_pair_similarity(match, row)
+
+            # Pair-first safety gate: both names must independently agree.
+            if (
+                oriented["player_a_score"] < 0.88
+                or oriented["player_b_score"] < 0.88
+                or oriented["pair_score"] < 0.90
+            ):
+                continue
+
+            ts = tournament_similarity(match.get("tournament"), tournament_name(row))
+            rd = row_date_obj(row)
+            md = parse_iso_date(match.get("date"))
+            date_score = 0.5
+            if rd and md:
+                delta = abs((rd - md).days)
+                date_score = 1.0 if delta <= 1 else 0.88 if delta <= 2 else 0.65
+
+            score = 0.82 * oriented["pair_score"] + 0.10 * ts + 0.08 * date_score
+
+            if score > best_score:
+                best_score = score
+                best_row = row
+
+        if best_row is not None and best_score >= 0.88:
+            apply_result(
+                match,
+                best_row,
+                best_row.get("_source_url") or "Sofascore daily tennis feed",
+                "pending_recovery_v9_live_fallback",
+            )
+            match["result_match_score"] = round(best_score, 4)
+            match["recovered_from_pending"] = True
+            match["recovery_version"] = "V9"
+            match.pop("sync_warning", None)
+            recovered += 1
+        else:
+            still_unresolved.append(item)
+
+    # Keep diagnostics readable.
+    fallback_sources = list(dict.fromkeys(fallback_sources))
+    return recovered, still_unresolved, fallback_sources
+
+
 def dedupe_after_recovery(matches):
     out = []
     merged = 0
@@ -911,6 +1091,13 @@ def main():
     recovered_pending, unresolved_pending, skipped_not_stale = recover_pending_results(
         matches, rows, source_url, today_ec
     )
+
+    # V9: if the CSV databases still do not contain a completed match, try a
+    # tournament-agnostic daily tennis feed before leaving the card unresolved.
+    recovered_v9, unresolved_pending, v9_sources = recover_pending_with_live_fallback(
+        matches, unresolved_pending, today_ec
+    )
+
     matches, recovery_dupes = dedupe_after_recovery(matches)
 
     # 6) Final fuzzy dedupe after ingestion.
@@ -968,11 +1155,12 @@ def main():
     print(f"Linked {linked_existing} source results to existing tracked cards.")
     print(f"Discovered {discovered} truly new ATP results.")
     print(f"Marked {pending_marked} stale scheduled matches as pending_result.")
-    print(f"Recovered {recovered_pending} pending/stale matches with V8 pair-first multi-source resolver.")
+    print(f"Recovered {recovered_pending} pending/stale matches with V8 CSV resolver.")
+    print(f"Recovered {recovered_v9} additional pending/stale matches with V9 live fallback.")
     print(f"Skipped {skipped_not_stale} scheduled matches that are today/future (not stale).")
     print(f"Removed/merged {recovery_dupes} result-only duplicates after recovery.")
     print(f"Unmatched stale/non-finished tracked cards before recovery: {unmatched_old}")
-    print(f"Still unresolved after V8 recovery: {len(unresolved_pending)}")
+    print(f"Still unresolved after V9 recovery: {len(unresolved_pending)}")
 
     if unresolved_pending:
         print("----- UNRESOLVED MATCHES -----")
@@ -1002,6 +1190,10 @@ def main():
     print("Sources loaded:")
     for loaded_source in source_urls:
         print(f" - {loaded_source}")
+    if v9_sources:
+        print("V9 fallback sources queried:")
+        for loaded_source in v9_sources:
+            print(f" - {loaded_source}")
 
 
 if __name__ == "__main__":
