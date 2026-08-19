@@ -196,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/18.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/19.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -898,7 +898,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/18.0"},
+            headers={"User-Agent": "SportsAI/19.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -2407,6 +2407,44 @@ def flashscore_card_from_event(event):
     }
 
 
+
+def normalize_provider_player_names(matches, rows):
+    """
+    V19: rewrite provider abbreviations to unique historical ATP full names.
+
+    Examples:
+      Fritz T. -> Taylor Fritz
+      O'Connell C. -> Christopher O'Connell
+      Tiafoe F. -> Frances Tiafoe
+      Auger-Aliassime F. -> Felix Auger-Aliassime
+
+    Only rewrites when expand_fixture_player_name can resolve the name
+    conservatively from the ATP history already loaded.
+    """
+    known = historical_player_names(rows)
+    changed = 0
+    changes = []
+
+    for m in matches:
+        for field in ("player_a", "player_b"):
+            old = str(m.get(field) or "").strip()
+            if not old:
+                continue
+
+            new = expand_fixture_player_name(old, known)
+            if new and norm(new) != norm(old):
+                m[field] = new
+                changed += 1
+                changes.append(f"{old} => {new}")
+
+        # Keep live-state display names aligned with the canonical card.
+        live = m.get("live_state")
+        if isinstance(live, dict):
+            live["player_a"] = m.get("player_a")
+            live["player_b"] = m.get("player_b")
+
+    return changed, list(dict.fromkeys(changes))
+
 def merge_flashscore_feed(matches, rows, today_ec):
     """
     Use Flashscore as an independent source for:
@@ -2418,6 +2456,13 @@ def merge_flashscore_feed(matches, rows, today_ec):
     No fixed expected daily match count.
     """
     events, diagnostics = fetch_flashscore_atp_feed()
+
+    # Resolve provider abbreviations before identity matching/card creation.
+    _known_names = historical_player_names(rows)
+    for _event in events:
+        _event["player_a"] = expand_fixture_player_name(_event.get("player_a"), _known_names)
+        _event["player_b"] = expand_fixture_player_name(_event.get("player_b"), _known_names)
+
     added = 0
     enriched = 0
     live_updated = 0
@@ -2487,15 +2532,17 @@ def main():
         discover_fixtures_from_github(matches, rows, today_ec)
     )
 
-    # Keep the old Sofascore discovery only as a secondary diagnostic fallback.
-    # It may be blocked with HTTP 403 in GitHub Actions, but it must never stop
-    # the updater.
-    fixture_added, fixture_enriched, fixture_seen, fixture_diagnostics = discover_scheduled_fixtures(
-        matches, today_ec
-    )
+    # V19: SofaScore direct endpoints are disabled in GitHub Actions because
+    # they consistently return HTTP 403. Flashscore is now the live/result source.
+    fixture_added = 0
+    fixture_enriched = 0
+    fixture_seen = 0
+    fixture_diagnostics = ["DISABLED::Sofascore direct API blocked by HTTP 403 in GitHub Actions"]
 
-    # V13: automatically analyze newly discovered fixtures using the ATP
-    # historical/result rows already loaded by the updater.
+    # V19: normalize any provider-created abbreviations before prediction.
+    v19_names_changed, v19_name_changes = normalize_provider_player_names(matches, rows)
+
+    # V13/V19: analyze newly discovered fixtures after names are canonical.
     provisional_enriched, provisional_pending = enrich_all_provisional_fixtures(
         matches, rows, today_ec
     )
@@ -2614,11 +2661,10 @@ def main():
         matches, rows, source_url, today_ec
     )
 
-    # V9: if the CSV databases still do not contain a completed match, try a
-    # tournament-agnostic daily tennis feed before leaving the card unresolved.
-    recovered_v9, unresolved_pending, v9_sources = recover_pending_with_live_fallback(
-        matches, unresolved_pending, today_ec
-    )
+    # V19: Flashscore already performs stale-result recovery before this stage.
+    # Do not call the blocked SofaScore fallback.
+    recovered_v9 = 0
+    v9_sources = ["DISABLED::Sofascore result fallback blocked by HTTP 403"]
 
     matches, recovery_dupes = dedupe_after_recovery(matches)
 
@@ -2672,7 +2718,13 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V18 FLASHSCORE FEED ===")
+    print("=== V19 NAME NORMALIZATION ===")
+    print(f"Provider player names normalized: {v19_names_changed}")
+    for _change in v19_name_changes:
+        print(f" - {_change}")
+    print("==============================")
+
+    print("=== V19 FLASHSCORE FEED ===")
     print(f"Relevant ATP rows (D-2..D+1): {fs_stats['relevant']}")
     print(f"Cards added from Flashscore: {fs_stats['added']}")
     print(f"Existing cards enriched from Flashscore: {fs_stats['enriched']}")
@@ -2683,12 +2735,12 @@ def main():
     print("===========================")
 
     audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
-    print("=== V18 GITHUB SOURCE ROW AUDIT ===")
+    print("=== V19 GITHUB SOURCE ROW AUDIT ===")
     print(f"Raw top-level ATP rows: {len(audit_rows)}")
     for i, a in enumerate(audit_rows, 1):
         print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
     print("============================")
-    print("=== V18 MULTI-SOURCE ATP DISCOVERY ===")
+    print("=== V19 MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2710,8 +2762,8 @@ def main():
     _finished = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "finished")
 
     print(f"Final unique scheduled/live fixtures today: {len(v14_today_cards)}")
-    print(f"V18 total unique matches today (all statuses): {len(v18_today_all)}")
-    print(f"V18 status split: scheduled={_scheduled} | live={_live} | finished={_finished}")
+    print(f"V19 total unique matches today (all statuses): {len(v18_today_all)}")
+    print(f"V19 status split: scheduled={_scheduled} | live={_live} | finished={_finished}")
     for i, m in enumerate(v14_today_cards, 1):
         print(f"[TODAY {i}] {m.get('tournament')} | {m.get('player_a')} vs {m.get('player_b')} | status={m.get('status')} | prediction={m.get('prediction_status') or 'existing'}")
     if v14_alias_log:
@@ -2724,9 +2776,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V18 optional Sofascore events seen today/tomorrow: {fixture_seen}")
-    print(f"V18 optional Sofascore fixtures added: {fixture_added}")
-    print(f"V18 optional Sofascore cards enriched: {fixture_enriched}")
+    print(f"V19 SofaScore events seen today/tomorrow: {fixture_seen}")
+    print(f"V19 SofaScore fixtures added: {fixture_added}")
+    print(f"V19 SofaScore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2779,7 +2831,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V18 optional Sofascore diagnostics (non-blocking):")
+    print("V19 SofaScore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
