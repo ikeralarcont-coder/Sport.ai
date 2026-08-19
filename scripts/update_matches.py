@@ -196,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/20.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/21.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -898,7 +898,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/20.0"},
+            headers={"User-Agent": "SportsAI/21.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -1366,7 +1366,7 @@ def daily_fixture_report(matches,today_ec,rows):
     known=historical_player_names(rows); seen=set(); cards=[]
     for m in matches:
         if parse_iso_date(m.get("date"))!=today_ec: continue
-        if str(m.get("status") or "").lower() not in {"scheduled","upcoming","pre","live"}: continue
+        if str(m.get("status") or "").lower() not in {"scheduled","upcoming","pre","live","interrupted","suspended","delayed","postponed"}: continue
         key=(norm(canonical_tournament(m.get("tournament"))),
              canonical_pair_key(m.get("player_a"),m.get("player_b"),known))
         if key in seen: continue
@@ -1380,7 +1380,7 @@ def enrich_all_provisional_fixtures(matches, rows, today_ec):
     pending = 0
     for m in matches:
         status = str(m.get("status") or "").lower()
-        if status not in {"scheduled", "upcoming", "pre", "live"}:
+        if status not in {"scheduled", "upcoming", "pre", "live", "interrupted", "suspended", "delayed", "postponed"}:
             continue
         if m.get("prediction_status") not in {"awaiting_prediction", "provisional_v13"}:
             continue
@@ -2227,6 +2227,14 @@ def fetch_flashscore_atp_feed(day_offsets=(-2, -1, 0, 1)):
                 "player_a": p1,
                 "player_b": p2,
                 "status_code": str(fields.get("AB") or ""),
+                # Preserve provider stage/status hints. Flashscore feed schemas
+                # vary by sport/event, so V21 stores them instead of discarding.
+                "status_stage": str(fields.get("BC") or fields.get("BA") or "").strip(),
+                "raw_status_fields": {
+                    k: fields.get(k)
+                    for k in ("AB", "BA", "BC", "AC")
+                    if fields.get(k) not in (None, "")
+                },
                 "score_a": as_int(fields.get("AG")),
                 "score_b": as_int(fields.get("AH")),
                 "game_a": fields.get("GRA"),
@@ -2298,15 +2306,21 @@ def _find_card_for_external_event(event, matches, rows):
 
 def _flashscore_apply_status(match, event):
     """
-    V20: update Sports AI card from Flashscore, including live scoreboard data.
+    V21: interruption-safe Flashscore state machine.
 
-    Keeps the pre-match prediction intact while updating:
-      scheduled -> live -> finished
-      set score
-      current game score when provided
-      last live sync timestamp
+    Known AB values:
+      1 -> scheduled
+      2 -> live
+      3 -> finished
+
+    For any other provider state, NEVER discard/downgrade an in-progress match.
+    Preserve its latest score and mark it interrupted/suspended until the feed
+    returns live or finished.
     """
     code = str(event.get("status_code") or "")
+    stage = str(event.get("status_stage") or "").strip()
+    stage_norm = norm(stage)
+
     sa = event.get("score_a")
     sb = event.get("score_b")
     ga = event.get("game_a")
@@ -2314,6 +2328,10 @@ def _flashscore_apply_status(match, event):
 
     match["flashscore_event_id"] = event.get("event_id")
     match["flashscore_source_url"] = event.get("source_url")
+    match["flashscore_raw_status_code"] = code
+    match["flashscore_status_stage"] = stage or None
+    match["flashscore_raw_status_fields"] = event.get("raw_status_fields") or {}
+    match["flashscore_last_seen_at"] = datetime.now(timezone.utc).isoformat()
     match["time_ecuador"] = event.get("time_ec") or match.get("time_ecuador")
     match["timezone"] = "America/Guayaquil"
 
@@ -2335,6 +2353,8 @@ def _flashscore_apply_status(match, event):
         "source_note": "Flashscore live feed",
         "source_url": event.get("source_url"),
         "synced_at": sync_time,
+        "raw_status_code": code,
+        "stage": stage or live.get("stage"),
     })
 
     if code == "3":
@@ -2355,34 +2375,81 @@ def _flashscore_apply_status(match, event):
             match["result_winner"] = winner
             match["result_synced_at"] = sync_time
             match["result_match_method"] = "flashscore_pair_date"
-
             if match.get("prediction_status") != "not_predicted_discovered":
                 predicted = (
                     match.get("player_a")
                     if float(match.get("player_a_probability", 0.5)) >= 0.5
                     else match.get("player_b")
                 )
-                match["prediction_correct"] = (
-                    player_similarity(predicted, winner) >= 0.88
-                )
+                match["prediction_correct"] = player_similarity(predicted, winner) >= 0.88
 
         match.pop("sync_warning", None)
+        match.pop("interruption_reason", None)
         return "finished"
 
     if code == "2":
         match["status"] = "live"
         live["status"] = "live"
+        live["interrupted"] = False
         match["live_state"] = live
+        match.pop("interruption_reason", None)
         return "live"
 
-    # Not started.
-    if str(match.get("status") or "").lower() in {
-        "", "scheduled", "upcoming", "pre", "pending_result"
-    }:
-        match["status"] = "scheduled"
+    # Textual hints if the provider exposes them.
+    interrupted_words = {
+        "interrupted", "suspended", "suspend", "rain delay", "rain",
+        "weather delay", "medical timeout", "paused", "pause",
+    }
+    delayed_words = {
+        "delayed", "postponed", "postpone", "not started", "waiting",
+    }
 
-    match["live_state"] = live if live else match.get("live_state")
-    return "scheduled"
+    stage_interrupted = any(word in stage_norm for word in interrupted_words)
+    stage_delayed = any(word in stage_norm for word in delayed_words)
+
+    previous = str(match.get("status") or "").lower()
+    had_live_data = (
+        previous in {"live", "interrupted", "suspended"}
+        or bool(live.get("set_score"))
+        or live.get("current_game") is not None
+    )
+
+    # Any unknown status after a match has been live is interruption-safe.
+    if stage_interrupted or (code not in {"1", "2", "3"} and had_live_data):
+        match["status"] = "interrupted"
+        match["interruption_reason"] = stage or "Partido interrumpido / suspendido"
+        live["status"] = "interrupted"
+        live["interrupted"] = True
+        match["live_state"] = live
+        return "interrupted"
+
+    # Delayed/postponed before play begins remains visible as delayed.
+    if stage_delayed or (code not in {"1", "2", "3"} and not had_live_data):
+        match["status"] = "delayed"
+        match["interruption_reason"] = stage or "Partido retrasado / reprogramado"
+        live["status"] = "delayed"
+        match["live_state"] = live
+        return "delayed"
+
+    # Normal scheduled event.
+    if code == "1":
+        # Critical: never turn an interrupted in-progress match back into a plain
+        # scheduled card unless there was no live score at all.
+        if previous in {"interrupted", "suspended"} and had_live_data:
+            match["status"] = "interrupted"
+            live["status"] = "interrupted"
+            match["live_state"] = live
+            return "interrupted"
+
+        match["status"] = "scheduled"
+        live["status"] = "scheduled"
+        match["live_state"] = live
+        return "scheduled"
+
+    # Last-resort preservation: do not make the card disappear.
+    match["status"] = previous or "delayed"
+    match["live_state"] = live
+    return match["status"]
 
 def flashscore_card_from_event(event):
     dt = event.get("datetime_ec")
@@ -2725,13 +2792,13 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V20 NAME NORMALIZATION ===")
+    print("=== V21 NAME NORMALIZATION ===")
     print(f"Provider player names normalized: {v19_names_changed}")
     for _change in v19_name_changes:
         print(f" - {_change}")
     print("==============================")
 
-    print("=== V20 FLASHSCORE LIVE FEED ===")
+    print("=== V21 FLASHSCORE INTERRUPTION-SAFE FEED ===")
     print(f"Relevant ATP rows (D-2..D+1): {fs_stats['relevant']}")
     print(f"Cards added from Flashscore: {fs_stats['added']}")
     print(f"Existing cards enriched from Flashscore: {fs_stats['enriched']}")
@@ -2742,12 +2809,12 @@ def main():
     print("===========================")
 
     audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
-    print("=== V20 GITHUB SOURCE ROW AUDIT ===")
+    print("=== V21 GITHUB SOURCE ROW AUDIT ===")
     print(f"Raw top-level ATP rows: {len(audit_rows)}")
     for i, a in enumerate(audit_rows, 1):
         print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
     print("============================")
-    print("=== V20 MULTI-SOURCE ATP DISCOVERY ===")
+    print("=== V21 MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2766,11 +2833,12 @@ def main():
 
     _scheduled = sum(1 for x in v18_today_all if str(x.get("status")).lower() in {"scheduled","upcoming","pre"})
     _live = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "live")
+    _interrupted = sum(1 for x in v18_today_all if str(x.get("status")).lower() in {"interrupted","suspended","delayed","postponed"})
     _finished = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "finished")
 
     print(f"Final unique scheduled/live fixtures today: {len(v14_today_cards)}")
-    print(f"V20 total unique matches today (all statuses): {len(v18_today_all)}")
-    print(f"V20 status split: scheduled={_scheduled} | live={_live} | finished={_finished}")
+    print(f"V21 total unique matches today (all statuses): {len(v18_today_all)}")
+    print(f"V21 status split: scheduled={_scheduled} | live={_live} | interrupted/delayed={_interrupted} | finished={_finished}")
     for i, m in enumerate(v14_today_cards, 1):
         print(f"[TODAY {i}] {m.get('tournament')} | {m.get('player_a')} vs {m.get('player_b')} | status={m.get('status')} | prediction={m.get('prediction_status') or 'existing'}")
     if v14_alias_log:
@@ -2783,9 +2851,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V20 SofaScore events seen today/tomorrow: {fixture_seen}")
-    print(f"V20 SofaScore fixtures added: {fixture_added}")
-    print(f"V20 SofaScore cards enriched: {fixture_enriched}")
+    print(f"V21 SofaScore events seen today/tomorrow: {fixture_seen}")
+    print(f"V21 SofaScore fixtures added: {fixture_added}")
+    print(f"V21 SofaScore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2838,7 +2906,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V20 SofaScore diagnostics (non-blocking):")
+    print("V21 SofaScore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
