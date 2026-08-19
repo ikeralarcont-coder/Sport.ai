@@ -32,14 +32,22 @@ main{max-width:900px;margin:auto;padding:22px 20px 60px}.hero{display:flex;justi
 .liveDot{width:7px;height:7px;border-radius:50%;background:#ff4d4d;display:inline-block;animation:pulse 1.2s infinite}
 .gameScore{font-weight:800;color:#ff8383}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
-.liveBoard{margin-top:10px;border-top:1px solid #ffffff12;padding-top:9px}.scoreGrid{display:grid;grid-template-columns:minmax(110px,1fr) repeat(5,28px) 44px;gap:5px;align-items:center;font-size:12px}.scoreGrid .sh{color:var(--mut);font-size:9px;text-align:center;font-weight:800}.scoreGrid .sn{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.scoreGrid .sv{text-align:center;font-weight:900}.scoreGrid .cur{color:var(--g)}.scoreGrid .pts{color:#ff8383}.setNow{margin-top:7px;color:var(--mut);font-size:11px}.setNow b{color:#fff}
-
 
 .badge.interrupted{background:#3a2d10;color:#ffd15c}
 .match.interrupted{border-color:#6e5620}
 .interruptedLine{margin-top:7px;font-size:12px;color:#ffd15c;font-weight:800}
+
+.liveTable{margin-top:12px;border-top:1px solid #ffffff12;padding-top:10px}
+.liveTableGrid{display:grid;grid-template-columns:minmax(130px,1fr) repeat(5,34px) 48px;gap:6px;align-items:center;font-size:12px}
+.liveTableGrid .th{color:#8ea09d;font-size:10px;text-align:center;font-weight:800}
+.liveTableGrid .pname{font-weight:850;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.liveTableGrid .score{text-align:center;font-weight:900}
+.liveTableGrid .pts{text-align:center;font-weight:950;color:#ff8383}
+.liveTableMeta{margin-top:8px;color:#8ea09d;font-size:11px}
+@media(max-width:620px){.liveTableGrid{grid-template-columns:minmax(105px,1fr) repeat(3,30px) 42px}.setExtra{display:none}}
+
 </style></head><body>
-<header><div class="nav"><div class="logo">SPORTS <i>AI</i> · TENNIS</div><div class="tag">AUTO · cada 10 min</div></div></header>
+<header><div class="nav"><div class="logo">SPORTS <i>AI</i> · TENNIS</div><div class="tag">LIVE · cada 5 s</div></div></header>
 <main><section class="hero"><div><h1>Entiende el partido,<br>no solo el porcentaje.</h1></div><p>Predicción, matchup, forma, torneo, fatiga, presión y señales que contradicen al favorito. Cada resultado queda auditado.</p></section>
 <div class="tabs"><button class="tab" data-f="live">En vivo</button><button class="tab on" data-f="next">Próximos</button><button class="tab" data-f="final">Resultados</button><button class="tab" data-f="pending">Pendientes</button><button class="tab" data-f="all">Todos</button></div>
 <div class="datebar">
@@ -140,7 +148,7 @@ async function boot(){
   render();
 
   // Cloudflare is lightweight, so poll it frequently for score/status changes.
-  setInterval(refreshLive,15000);
+  setInterval(refreshLive,5000);
   // Re-read the full GitHub Pages dataset less often for new predictions/cards.
   setInterval(refreshBase,60000);
 }
@@ -207,44 +215,70 @@ function render(){
   }).join('') || '<div class="empty">No hay partidos para esta fecha/filtro.</div>';
 }
 
-function liveBoard(m,st){
-  const sets=(st?.sets||[]).filter(x=>x&&x.a!=null&&x.b!=null);
-  const ga=st?.current_game?.player_a, gb=st?.current_game?.player_b;
-  if(!sets.length && ga==null && gb==null) return '';
-  const maxSets=Math.max(sets.length,1);
-  const heads=Array.from({length:5},(_,i)=>`<span class="sh">${i<maxSets?'S'+(i+1):''}</span>`).join('');
-  const vals=(who)=>Array.from({length:5},(_,i)=>{
-    const set=sets[i]; const v=set?.[who];
-    return `<span class="sv ${i===sets.length-1?'cur':''}">${v??''}</span>`;
-  }).join('');
-  const current=sets.length?sets[sets.length-1]:st?.current_set;
-  const setNo=Math.max(1,sets.length);
-  const gameLine=current&&current.a!=null&&current.b!=null
-    ? `<div class="setNow">Set ${setNo} en juegos: <b>${current.a}-${current.b}</b>${ga!=null||gb!=null?` · puntos <b>${ga??'-'}-${gb??'-'}</b>`:''}</div>`
-    : (ga!=null||gb!=null?`<div class="setNow">Puntos del game: <b>${ga??'-'}-${gb??'-'}</b></div>`:'');
-  return `<div class="liveBoard"><div class="scoreGrid"><span></span>${heads}<span class="sh">PTS</span><span class="sn">${m.player_a}</span>${vals('a')}<span class="sv pts">${ga??'-'}</span><span class="sn">${m.player_b}</span>${vals('b')}<span class="sv pts">${gb??'-'}</span></div>${gameLine}</div>`;
-}
-
 function card(m){
-  let s=state(m),st=m.live_state,pa=m.player_a_probability??.5,pb=m.player_b_probability??.5;
+  let s=state(m),st=m.live_state||{},pa=m.player_a_probability??.5,pb=m.player_b_probability??.5;
   let badge=s==='final'?'FINAL':s==='live'?'EN VIVO':s==='interrupted'?'INTERRUMPIDO':s==='pending'?'PENDIENTE':'PRÓXIMO';
+
   let provisional=m.prediction_status==='provisional_v13';
   let awaiting=m.prediction_status==='awaiting_prediction';
+
   let nums;
-  if(['final','live','interrupted'].includes(s)) nums=[st?.set_score?.[0]??'',st?.set_score?.[1]??''];
-  else if(awaiting) nums=['—','—'];
-  else nums=[pct(pa),pct(pb)];
+  if(['final','live','interrupted'].includes(s)){
+    nums=[st?.set_score?.[0]??'',st?.set_score?.[1]??''];
+  }else if(awaiting){
+    nums=['—','—'];
+  }else{
+    nums=[pct(pa),pct(pb)];
+  }
+
+  const rawSets = Array.isArray(st?.sets) ? st.sets : [];
+  const goodSets = rawSets.filter(x =>
+    x && Number.isFinite(Number(x.a)) && Number.isFinite(Number(x.b)) &&
+    (Number(x.a)>0 || Number(x.b)>0)
+  ).slice(0,5);
+
+  const pointA = st?.current_game?.player_a;
+  const pointB = st?.current_game?.player_b;
 
   let statusLine='';
-  if(s==='live') statusLine=`<div class="liveScore"><span class="liveDot"></span>EN VIVO</div>${liveBoard(m,st)}`;
-  else if(s==='interrupted') statusLine=`<div class="interruptedLine">⏸ ${m.interruption_reason||st?.stage||'Partido temporalmente interrumpido'}</div>${liveBoard(m,st)}`;
+  if(s==='live'){
+    const game=(pointA!=null||pointB!=null)
+      ? ` · <span class="gameScore">Puntos ${pointA??'-'}-${pointB??'-'}</span>`:'';
+    statusLine=`<div class="liveScore"><span class="liveDot"></span>EN VIVO${game}</div>`;
+  }else if(s==='interrupted'){
+    statusLine=`<div class="interruptedLine">⏸ ${m.interruption_reason||st?.stage||'Partido temporalmente interrumpido'}</div>`;
+  }
+
+  let liveTable='';
+  if(['live','interrupted'].includes(s)){
+    const setHeaders=[1,2,3,4,5].map((n,i)=>`<span class="th ${i>=3?'setExtra':''}">S${n}</span>`).join('');
+    const row=(name,key)=> {
+      const vals=[0,1,2,3,4].map((i)=>{
+        const v=goodSets[i]?.[key];
+        return `<span class="score ${i>=3?'setExtra':''}">${v==null?'':v}</span>`;
+      }).join('');
+      const pts=key==='a' ? pointA : pointB;
+      return `<span class="pname">${name}</span>${vals}<span class="pts">${pts??'—'}</span>`;
+    };
+    const currentSet = st?.current_set;
+    const currentText = currentSet && (currentSet.a!=null || currentSet.b!=null)
+      ? ` · set actual ${currentSet.a??'-'}-${currentSet.b??'-'}` : '';
+    liveTable=`<div class="liveTable">
+      <div class="liveTableGrid">
+        <span></span>${setHeaders}<span class="th">PTS</span>
+        ${row(m.player_a,'a')}
+        ${row(m.player_b,'b')}
+      </div>
+      <div class="liveTableMeta">Sets ${st?.set_score?.[0]??'-'}-${st?.set_score?.[1]??'-'}${currentText}</div>
+    </div>`;
+  }
 
   let hint=s==='final'
-    ? (st?.sets||[]).map(x=>x.a+'-'+x.b).join(' · ')+' · '+(st?.winner||'')
+    ? (goodSets.length?goodSets.map(x=>x.a+'-'+x.b).join(' · '):'')+' · '+(st?.winner||'')
     : s==='live'
-      ? `Sets ${st?.set_score?.[0]??'-'}-${st?.set_score?.[1]??'-'} · actualizado ${st?.synced_at?new Date(st.synced_at).toLocaleTimeString('es-EC',{hour:'2-digit',minute:'2-digit'}):''}`
+      ? `actualizado ${st?.synced_at?new Date(st.synced_at).toLocaleTimeString('es-EC',{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'ahora'}`
       : s==='interrupted'
-        ? `Último marcador: ${st?.set_score?.[0]??'-'}-${st?.set_score?.[1]??'-'} · se mantiene visible hasta reanudación`
+        ? `Último marcador guardado · se mantiene visible hasta reanudación`
         : s==='pending'
           ? `${m.date} · Resultado pendiente de sincronizar`
           : `${m.date}${m.time_ecuador?' · '+m.time_ecuador+' EC':''} · ${m.surface||''}${provisional?' · análisis provisional':''}`;
@@ -254,6 +288,7 @@ function card(m){
     <div class="row"><span class="name">${m.player_a}</span><span class="num">${nums[0]}</span></div>
     <div class="row"><span class="name">${m.player_b}</span><span class="num">${nums[1]}</span></div>
     ${statusLine}
+    ${liveTable}
     ${s==='next'&&!awaiting?`<div class="bar"><span style="width:${pa*100}%"></span><span style="width:${pb*100}%"></span></div>`:''}
     <div class="hint">${hint}</div>
   </article>`
