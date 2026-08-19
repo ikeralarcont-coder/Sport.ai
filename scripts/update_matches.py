@@ -191,7 +191,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/13.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/14.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -850,7 +850,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/13.0"},
+            headers={"User-Agent": "SportsAI/14.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -1219,6 +1219,99 @@ def enrich_fixture_with_provisional_analysis(match, rows, today_ec):
     return True
 
 
+
+def canonical_player_identity(name, known_names=None):
+    raw = clean_fixture_player_name(name)
+    n = norm(raw)
+    if not n:
+        return ""
+    if known_names:
+        expanded = expand_fixture_player_name(raw, known_names)
+        if expanded and norm(expanded) != n:
+            raw, n = expanded, norm(expanded)
+    parts = [p for p in n.split() if p]
+    if not parts:
+        return ""
+    if len(parts[0]) == 1:
+        initial, surname_parts = parts[0], parts[1:]
+    elif len(parts[-1]) == 1:
+        initial, surname_parts = parts[-1], parts[:-1]
+    else:
+        initial = parts[0][0]
+        particles={"de","del","van","von","da","dos","di","la","le"}
+        if len(parts)>=3 and parts[-2] in particles:
+            surname_parts=parts[-2:]
+        elif len(parts)>=3 and parts[-3] in particles:
+            surname_parts=parts[-3:]
+        else:
+            surname_parts=parts[-1:]
+    return f"{''.join(surname_parts)}:{initial}"
+
+def canonical_pair_key(a,b,known_names=None):
+    return tuple(sorted((canonical_player_identity(a,known_names),
+                         canonical_player_identity(b,known_names))))
+
+def card_information_score(m):
+    s=0
+    if m.get("prediction_status") not in (None,"","awaiting_prediction"): s+=12
+    if m.get("written_analysis"): s+=10
+    if m.get("analysis"): s+=8
+    if m.get("time_ecuador"): s+=4
+    if m.get("round"): s+=3
+    if m.get("surface") and norm(m.get("surface"))!="unknown": s+=3
+    if m.get("fixture_event_id"): s+=2
+    if m.get("player_a_probability") not in (None,0.5): s+=4
+    if m.get("status")=="finished": s+=20
+    return s
+
+def merge_match_cards(primary,secondary):
+    protected={"match_id","player_a","player_b","player_a_probability",
+               "player_b_probability","favorite","favorite_probability",
+               "analysis","written_analysis","prediction_status","model_name"}
+    for k,v in secondary.items():
+        if k not in protected and primary.get(k) in (None,"",[],{}) and v not in (None,"",[],{}):
+            primary[k]=v
+    if secondary.get("status")=="finished" and primary.get("status")!="finished":
+        for k in ("status","winner","loser","score","live_state","result_source",
+                  "result_source_url","result_updated_at","source_winner",
+                  "source_loser","source_score"):
+            if secondary.get(k) is not None: primary[k]=secondary[k]
+    return primary
+
+def dedupe_daily_identity(matches,today_ec,rows):
+    known=historical_player_names(rows)
+    groups,other={},[]
+    for m in matches:
+        if parse_iso_date(m.get("date"))!=today_ec:
+            other.append(m); continue
+        pair=canonical_pair_key(m.get("player_a"),m.get("player_b"),known)
+        if not all(pair):
+            other.append(m); continue
+        key=(today_ec.isoformat(),norm(canonical_tournament(m.get("tournament"))),pair)
+        groups.setdefault(key,[]).append(m)
+    merged=[]; removed=0; alias_log=[]
+    for cards in groups.values():
+        cards=sorted(cards,key=card_information_score,reverse=True)
+        keep=cards[0]
+        for dup in cards[1:]:
+            alias_log.append(f"{dup.get('player_a')} vs {dup.get('player_b')} => {keep.get('player_a')} vs {keep.get('player_b')}")
+            keep=merge_match_cards(keep,dup); removed+=1
+        merged.append(keep)
+    return other+merged,removed,alias_log
+
+def daily_fixture_report(matches,today_ec,rows):
+    known=historical_player_names(rows); seen=set(); cards=[]
+    for m in matches:
+        if parse_iso_date(m.get("date"))!=today_ec: continue
+        if str(m.get("status") or "").lower() not in {"scheduled","upcoming","pre","live"}: continue
+        key=(norm(canonical_tournament(m.get("tournament"))),
+             canonical_pair_key(m.get("player_a"),m.get("player_b"),known))
+        if key in seen: continue
+        seen.add(key); cards.append(m)
+    cards.sort(key=lambda m:(str(m.get("time_ecuador") or m.get("source_time") or "99:99"),
+                             str(m.get("tournament") or ""),str(m.get("player_a") or "")))
+    return cards
+
 def enrich_all_provisional_fixtures(matches, rows, today_ec):
     enriched = 0
     pending = 0
@@ -1370,7 +1463,7 @@ def _http_json(url):
         url,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/13.0",
+                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/14.0",
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://www.sofascore.com/",
         },
@@ -1685,7 +1778,7 @@ def sofascore_rows_for_match(match, today_ec):
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 SportsAI/13.0",
+                    "User-Agent": "Mozilla/5.0 SportsAI/14.0",
                     "Accept": "application/json",
                 },
             )
@@ -1904,6 +1997,9 @@ def main():
         matches, rows, today_ec
     )
 
+    # V14: canonical identity + dynamic daily dedupe. No fixed match count.
+    matches, v14_alias_dupes, v14_alias_log = dedupe_daily_identity(matches, today_ec, rows)
+
     # 0) Normalize and remove all TBD/TBD cards.
     cleaned = []
     removed_placeholders = 0
@@ -2070,6 +2166,17 @@ def main():
         encoding="utf-8",
     )
 
+    print("=== V14 DYNAMIC DAILY ATP DISCOVERY ===")
+    print(f"Date Ecuador: {today_ec.isoformat()}")
+    print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
+    print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
+    print(f"Final unique scheduled/live fixtures today: {len(v14_today_cards)}")
+    for i, m in enumerate(v14_today_cards, 1):
+        print(f"[TODAY {i}] {m.get('tournament')} | {m.get('player_a')} vs {m.get('player_b')} | status={m.get('status')} | prediction={m.get('prediction_status') or 'existing'}")
+    if v14_alias_log:
+        print("V14 alias merges:")
+        for item in v14_alias_log: print(f" - {item}")
+    print("=======================================")
     print(f"V13 newly discovered fixtures analyzed provisionally: {provisional_enriched}")
     print(f"V13 fixtures still awaiting sufficient player data: {provisional_pending}")
     print(f"V12 GitHub top-level ATP fixtures eligible today: {gh_fixture_eligible}")
