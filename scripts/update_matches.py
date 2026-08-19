@@ -191,7 +191,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/11.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/12.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -752,13 +752,257 @@ def recover_pending_results(matches, rows, default_source, today_ec):
 
 
 
+
+GITHUB_FIXTURE_FEED = (
+    "https://raw.githubusercontent.com/"
+    "Mriganka-codes/tennis_data/refs/heads/main/matches.json"
+)
+
+
+def clean_fixture_player_name(name):
+    """
+    TennisExplorer-style names often look like:
+      Cobolli F. (7)
+      De Minaur A. (5)
+
+    Remove seed/ranking parentheses while preserving the player name.
+    """
+    s = str(name or "").strip()
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    return s
+
+
+def historical_player_names(rows):
+    names = set()
+    for row in rows:
+        for key in ("winner_name", "loser_name"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                names.add(value)
+    return sorted(names)
+
+
+def expand_fixture_player_name(raw_name, known_names):
+    """
+    Convert abbreviated feed names such as "Cobolli F." to the most likely
+    full player name from our ATP result database.
+
+    If the mapping is ambiguous, keep the source name instead of guessing.
+    """
+    raw = clean_fixture_player_name(raw_name)
+    if not raw:
+        return raw
+
+    # Already full-looking.
+    parts = norm(raw).split()
+    if len(parts) >= 2 and len(parts[-1]) > 1 and "." not in raw:
+        return raw
+
+    # TennisExplorer commonly uses "Surname F.".
+    m = re.match(r"^(.*?)\s+([A-Za-z])\.$", raw)
+    if not m:
+        return raw
+
+    surname_raw = norm(m.group(1))
+    initial = m.group(2).lower()
+
+    candidates = []
+    for full in known_names:
+        full_parts = norm(full).split()
+        if not full_parts:
+            continue
+        full_surname = full_parts[-1]
+        full_initial = full_parts[0][0] if full_parts[0] else ""
+
+        # Multi-token surnames: "De Minaur A." should match Alex de Minaur.
+        normalized_full = norm(full)
+        surname_match = (
+            full_surname == surname_raw
+            or normalized_full.endswith(" " + surname_raw)
+            or surname_raw in normalized_full
+        )
+
+        if surname_match and full_initial == initial:
+            candidates.append(full)
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Score ambiguous candidates and only accept a clearly superior result.
+    scored = []
+    for full in candidates:
+        score = player_similarity(raw, full)
+        scored.append((score, full))
+    scored.sort(reverse=True)
+
+    if scored and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+        return scored[0][1]
+
+    return raw
+
+
+def download_github_fixture_feed():
+    """
+    Free GitHub-hosted fixture source. Unlike Sofascore, raw.githubusercontent
+    works reliably inside GitHub Actions and does not require an API key.
+    """
+    diagnostics = []
+    try:
+        req = urllib.request.Request(
+            GITHUB_FIXTURE_FEED,
+            headers={"User-Agent": "SportsAI/12.0"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        diagnostics.append(
+            f"OK::{GITHUB_FIXTURE_FEED}::"
+            f"last_updated={payload.get('last_updated')}::count={payload.get('count')}"
+        )
+        return payload, diagnostics
+    except Exception as e:
+        diagnostics.append(
+            f"ERROR::{GITHUB_FIXTURE_FEED}::{type(e).__name__}: {e}"
+        )
+        return {}, diagnostics
+
+
+def github_fixture_card(item, today_ec, known_names):
+    tournament = canonical_tournament(item.get("tournament") or "ATP Tournament")
+    p1 = expand_fixture_player_name(item.get("player1"), known_names)
+    p2 = expand_fixture_player_name(item.get("player2"), known_names)
+
+    source_time = str(item.get("time") or "").strip() or None
+
+    # The upstream scraper does not publish an explicit timezone contract in
+    # each row, so preserve the displayed source clock separately instead of
+    # falsely claiming it is Ecuador time.
+    card = {
+        "match_id": (
+            "GHFIX-" +
+            "-".join(
+                norm(x).replace(" ", "-")
+                for x in [today_ec.isoformat(), tournament, p1, p2]
+                if x
+            )[:170]
+        ),
+        "date": today_ec.isoformat(),
+        "time_label": source_time or "Horario por confirmar",
+        "source_time": source_time,
+        "tournament": tournament,
+        "tournament_level": "ATP",
+        "surface": "Unknown",
+        "round": "",
+        "player_a": p1,
+        "player_b": p2,
+        "event_type": "Singles",
+        "status": "scheduled",
+        "source": "GitHub TennisExplorer fixture feed",
+        "fixture_source_url": GITHUB_FIXTURE_FEED,
+        "fixture_discovered_automatically": True,
+        "fixture_discovered_at": datetime.now(timezone.utc).isoformat(),
+        "prediction_status": "awaiting_prediction",
+        "player_a_probability": 0.5,
+        "player_b_probability": 0.5,
+    }
+
+    if item.get("odds1") is not None or item.get("odds2") is not None:
+        card["market_snapshot"] = {
+            "odds_player_a": item.get("odds1"),
+            "odds_player_b": item.get("odds2"),
+            "note": "Odds from external fixture feed; not used as model probability.",
+        }
+
+    return card
+
+
+def discover_fixtures_from_github(matches, rows, today_ec):
+    """
+    V12 fixture discovery.
+
+    Only top-level ATP men's singles are added. Challenger rows are excluded
+    even though the upstream feed labels them with tour='ATP'.
+    """
+    payload, diagnostics = download_github_fixture_feed()
+    items = payload.get("matches") or []
+    known_names = historical_player_names(rows)
+
+    added = 0
+    enriched = 0
+    eligible = 0
+    skipped_challenger = 0
+
+    for item in items:
+        if norm(item.get("tour")) != "atp":
+            continue
+
+        tournament_raw = str(item.get("tournament") or "")
+        tournament_norm = norm(tournament_raw)
+
+        # Upstream uses ATP for Challenger too. Sports AI currently tracks
+        # top-level tour events, so exclude Challenger/qualifying/lower tours.
+        if any(x in tournament_norm for x in ("challenger", "qualification", "qualifying")):
+            skipped_challenger += 1
+            continue
+
+        p1_raw = clean_fixture_player_name(item.get("player1"))
+        p2_raw = clean_fixture_player_name(item.get("player2"))
+        if not p1_raw or not p2_raw or is_placeholder(p1_raw) or is_placeholder(p2_raw):
+            continue
+
+        eligible += 1
+        card = github_fixture_card(item, today_ec, known_names)
+
+        # Use the same pair-first matcher against existing cards.
+        best_idx = None
+        best_score = 0.0
+        for idx, existing in enumerate(matches):
+            ps = pair_similarity(
+                card["player_a"], card["player_b"],
+                existing.get("player_a"), existing.get("player_b")
+            )
+            if ps < 0.88:
+                continue
+
+            ts = tournament_similarity(card["tournament"], existing.get("tournament"))
+            md = parse_iso_date(existing.get("date"))
+            date_score = 1.0 if md == today_ec else 0.65
+
+            score = 0.80 * ps + 0.14 * ts + 0.06 * date_score
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is not None and best_score >= 0.89:
+            existing = matches[best_idx]
+
+            # Do not overwrite model data; only enrich scheduling/source info.
+            for key in (
+                "source_time", "time_label", "fixture_source_url",
+                "fixture_discovered_automatically", "fixture_discovered_at",
+                "market_snapshot",
+            ):
+                if card.get(key) is not None:
+                    existing[key] = card[key]
+
+            if str(existing.get("status") or "").lower() in {"scheduled", "upcoming", "pre"}:
+                existing["status"] = "scheduled"
+
+            existing["fixture_match_score"] = round(best_score, 4)
+            enriched += 1
+        else:
+            matches.append(card)
+            added += 1
+
+    return added, enriched, eligible, skipped_challenger, diagnostics
+
 def _http_json(url):
     """Small browser-like JSON fetcher used by V11 fixture discovery."""
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/11.0",
+                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/12.0",
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://www.sofascore.com/",
         },
@@ -1073,7 +1317,7 @@ def sofascore_rows_for_match(match, today_ec):
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 SportsAI/11.0",
+                    "User-Agent": "Mozilla/5.0 SportsAI/12.0",
                     "Accept": "application/json",
                 },
             )
@@ -1274,8 +1518,14 @@ def main():
     source_url = source_urls[0] if source_urls else "unknown"
     today_ec = datetime.now(ECUADOR_TZ).date()
 
-    # V11 fixture discovery: populate today's/tomorrow's ATP singles schedule
-    # before normal result synchronization.
+    # V12: GitHub-hosted daily fixture discovery (no API key / no Sofascore 403).
+    gh_fixture_added, gh_fixture_enriched, gh_fixture_eligible, gh_fixture_skipped_ch, gh_fixture_diagnostics = (
+        discover_fixtures_from_github(matches, rows, today_ec)
+    )
+
+    # Keep the old Sofascore discovery only as a secondary diagnostic fallback.
+    # It may be blocked with HTTP 403 in GitHub Actions, but it must never stop
+    # the updater.
     fixture_added, fixture_enriched, fixture_seen, fixture_diagnostics = discover_scheduled_fixtures(
         matches, today_ec
     )
@@ -1446,9 +1696,13 @@ def main():
         encoding="utf-8",
     )
 
-    print(f"V11 ATP fixture events seen today/tomorrow: {fixture_seen}")
-    print(f"V11 scheduled fixtures added: {fixture_added}")
-    print(f"V11 existing cards enriched with fixture time/id: {fixture_enriched}")
+    print(f"V12 GitHub top-level ATP fixtures eligible today: {gh_fixture_eligible}")
+    print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
+    print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
+    print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
+    print(f"V11 Sofascore events seen today/tomorrow: {fixture_seen}")
+    print(f"V11 Sofascore fixtures added: {fixture_added}")
+    print(f"V11 Sofascore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -1497,7 +1751,11 @@ def main():
         for loaded_source in v9_sources:
             print(f" - {loaded_source}")
 
-    print("V11 fixture-discovery diagnostics:")
+    print("V12 GitHub fixture-discovery diagnostics:")
+    for diagnostic in gh_fixture_diagnostics:
+        print(f" - {diagnostic}")
+
+    print("V11 Sofascore fixture-discovery diagnostics:")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
