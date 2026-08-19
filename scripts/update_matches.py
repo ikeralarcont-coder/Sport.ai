@@ -8,6 +8,7 @@ import re
 import unicodedata
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,8 @@ TOURNAMENT_ALIASES = {
     "cincinnati open": "Cincinnati Open",
     "cincinnati masters": "Cincinnati Open",
     "western southern open": "Cincinnati Open",
+    "western and southern open": "Cincinnati Open",
+    "cincy": "Cincinnati Open",
     "us open": "US Open",
     "u s open": "US Open",
     "roland garros": "Roland Garros",
@@ -43,6 +46,26 @@ def norm(v):
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
+def compact(v):
+    return norm(v).replace(" ", "")
+
+
+def name_parts(v):
+    n = norm(v)
+    parts = n.split()
+    return parts
+
+
+def surname(v):
+    p = name_parts(v)
+    return p[-1] if p else ""
+
+
+def first_initial(v):
+    p = name_parts(v)
+    return p[0][0] if p and p[0] else ""
+
+
 def is_placeholder(v):
     return norm(v) in PLACEHOLDER_NAMES
 
@@ -51,20 +74,66 @@ def canonical_tournament(v):
     n = norm(v)
     if n in TOURNAMENT_ALIASES:
         return TOURNAMENT_ALIASES[n]
-
-    # Flexible aliases for names that contain sponsor/edition text.
     if "cincinnati" in n:
         return "Cincinnati Open"
     if n in {"us open tennis", "u s open tennis"}:
         return "US Open"
     if "roland garros" in n or "french open" in n:
         return "Roland Garros"
-
     return str(v or "ATP Tournament").strip()
 
 
 def tournament_key(v):
     return norm(canonical_tournament(v))
+
+
+def tournament_similarity(a, b):
+    ca, cb = tournament_key(a), tournament_key(b)
+    if ca == cb:
+        return 1.0
+    if ca and cb and (ca in cb or cb in ca):
+        return 0.94
+    return SequenceMatcher(None, ca, cb).ratio()
+
+
+def player_similarity(a, b):
+    """
+    Robust but conservative player-name similarity.
+
+    Examples intended to match:
+      Juan Manuel Cerundolo <-> J. M. Cerundolo
+      Felix Auger-Aliassime <-> Felix Auger Aliassime
+      Nuno Borges <-> N. Borges
+    """
+    na, nb = norm(a), norm(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    if compact(a) == compact(b):
+        return 0.99
+
+    sa, sb = surname(a), surname(b)
+    ia, ib = first_initial(a), first_initial(b)
+
+    seq = SequenceMatcher(None, na, nb).ratio()
+
+    # Same surname is a strong signal. Initial agreement raises confidence.
+    if sa and sb and sa == sb:
+        if ia and ib and ia == ib:
+            return max(seq, 0.94)
+        return max(seq, 0.86)
+
+    return seq
+
+
+def pair_similarity(a1, a2, b1, b2):
+    """
+    Compare an unordered pair of players and return the strongest orientation.
+    """
+    direct = (player_similarity(a1, b1) + player_similarity(a2, b2)) / 2
+    swapped = (player_similarity(a1, b2) + player_similarity(a2, b1)) / 2
+    return max(direct, swapped)
 
 
 def parse_iso_date(v):
@@ -110,7 +179,7 @@ def download_rows():
     last_error = None
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/4.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/5.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
             rows = list(csv.DictReader(io.StringIO(text)))
@@ -118,7 +187,6 @@ def download_rows():
                 return rows, url
         except Exception as e:
             last_error = e
-
     raise RuntimeError(f"No ATP source available: {last_error}")
 
 
@@ -148,6 +216,10 @@ def row_date(row):
     return datetime.now(ECUADOR_TZ).date().isoformat()
 
 
+def row_date_obj(row):
+    return parse_iso_date(row_date(row))
+
+
 def row_id(row):
     bits = [
         row_date(row),
@@ -161,13 +233,20 @@ def row_id(row):
 
 
 def same_tournament(a, b):
-    return tournament_key(a) == tournament_key(b)
+    return tournament_similarity(a, b) >= 0.82
 
 
 def make_state(match, row, source_url):
-    a_is_winner = norm(match["player_a"]) == norm(row.get("winner_name"))
-    sets = []
+    a_name = match["player_a"]
+    b_name = match["player_b"]
 
+    # Determine which source player corresponds to player A using similarity,
+    # rather than requiring exact spelling.
+    sim_a_w = player_similarity(a_name, row.get("winner_name"))
+    sim_a_l = player_similarity(a_name, row.get("loser_name"))
+    a_is_winner = sim_a_w >= sim_a_l
+
+    sets = []
     for s in parse_score(row.get("score")):
         if a_is_winner:
             sets.append({"a": s["winner"], "b": s["loser"]})
@@ -200,8 +279,8 @@ def make_state(match, row, source_url):
 
     return {
         "status": "finished",
-        "player_a": match["player_a"],
-        "player_b": match["player_b"],
+        "player_a": a_name,
+        "player_b": b_name,
         "sets": sets,
         "set_score": [
             sum(s["a"] > s["b"] for s in sets),
@@ -219,13 +298,14 @@ def make_state(match, row, source_url):
     }
 
 
-def apply_result(match, row, source_url):
+def apply_result(match, row, source_url, match_method="exact"):
     state = make_state(match, row, source_url)
 
     match["status"] = "finished"
     match["live_state"] = state
     match["result_winner"] = state["winner"]
     match["result_synced_at"] = datetime.now(timezone.utc).isoformat()
+    match["result_match_method"] = match_method
 
     if match.get("prediction_status") != "not_predicted_discovered":
         predicted = (
@@ -233,7 +313,9 @@ def apply_result(match, row, source_url):
             if float(match.get("player_a_probability", 0.5)) >= 0.5
             else match["player_b"]
         )
-        match["prediction_correct"] = norm(predicted) == norm(state["winner"])
+        match["prediction_correct"] = (
+            player_similarity(predicted, state["winner"]) >= 0.88
+        )
 
     return match
 
@@ -241,7 +323,6 @@ def apply_result(match, row, source_url):
 def discover_finished(row, source_url):
     winner = row.get("winner_name")
     loser = row.get("loser_name")
-
     m = {
         "match_id": row_id(row),
         "date": row_date(row),
@@ -259,8 +340,7 @@ def discover_finished(row, source_url):
         "player_b_probability": 0.5,
         "discovered_automatically": True,
     }
-
-    apply_result(m, row, source_url)
+    apply_result(m, row, source_url, "discovered")
     m["prediction_correct"] = None
     m["postmatch_summary"] = (
         f"{winner} ganó este partido. Se descubrió después de terminar, "
@@ -270,7 +350,6 @@ def discover_finished(row, source_url):
 
 
 def match_identity(m):
-    """Identity independent of aliases and player order."""
     pair = tuple(sorted((norm(m.get("player_a")), norm(m.get("player_b")))))
     return (
         pair,
@@ -280,10 +359,6 @@ def match_identity(m):
 
 
 def record_quality(m):
-    """
-    Prefer a real pre-match prediction over a result discovered after the fact.
-    Within that, prefer finished > pending_result > live > scheduled.
-    """
     predicted_before = m.get("prediction_status") != "not_predicted_discovered"
     status_rank = {
         "finished": 4,
@@ -291,7 +366,6 @@ def record_quality(m):
         "live": 2,
         "scheduled": 1,
     }.get(str(m.get("status") or "").lower(), 0)
-
     return (
         1 if predicted_before else 0,
         status_rank,
@@ -301,16 +375,13 @@ def record_quality(m):
 
 
 def merge_records(primary, secondary):
-    """
-    Keep prediction fields from the stronger record, but copy verified result
-    information from the other record when available.
-    """
     result_fields = [
         "live_state",
         "result_winner",
         "result_synced_at",
         "prediction_correct",
         "postmatch_summary",
+        "result_match_method",
     ]
 
     if str(secondary.get("status")).lower() == "finished":
@@ -320,7 +391,6 @@ def merge_records(primary, secondary):
         if secondary.get(field) is not None and primary.get(field) is None:
             primary[field] = secondary[field]
 
-    # Fill missing metadata without overwriting a real pre-match analysis.
     for key, value in secondary.items():
         if key not in primary or primary.get(key) in (None, "", []):
             primary[key] = value
@@ -328,77 +398,167 @@ def merge_records(primary, secondary):
     return primary
 
 
+def find_best_result(match, rows):
+    """
+    1) Try exact normalized player pair.
+    2) If that fails, use conservative fuzzy player matching plus tournament/date.
+    Round is only a bonus, never a blocker.
+    """
+    a = match.get("player_a")
+    b = match.get("player_b")
+    target_pair = frozenset((norm(a), norm(b)))
+
+    exact = [r for r in rows if row_pair(r) == target_pair]
+    if exact:
+        # Prefer same tournament if available.
+        same_t = [r for r in exact if same_tournament(tournament_name(r), match.get("tournament"))]
+        if same_t:
+            exact = same_t
+        return exact[-1], "exact", 1.0
+
+    md = parse_iso_date(match.get("date"))
+    best = None
+    best_score = 0.0
+
+    for r in rows:
+        ps = pair_similarity(
+            a, b,
+            r.get("winner_name"),
+            r.get("loser_name"),
+        )
+        if ps < 0.87:
+            continue
+
+        ts = tournament_similarity(match.get("tournament"), tournament_name(r))
+
+        rd = row_date_obj(r)
+        date_score = 0.5
+        if md and rd:
+            delta = abs((md - rd).days)
+            if delta <= 1:
+                date_score = 1.0
+            elif delta <= 7:
+                date_score = 0.85
+            elif delta <= 21:
+                date_score = 0.65
+            else:
+                date_score = 0.25
+
+        round_bonus = 0.0
+        if match.get("round") and round_code(r) == str(match.get("round")).upper().strip():
+            round_bonus = 0.04
+
+        # Player names dominate. Tournament/date prevent wrong historical matches.
+        score = (0.72 * ps) + (0.18 * ts) + (0.10 * date_score) + round_bonus
+
+        if score > best_score:
+            best_score = score
+            best = r
+
+    # Conservative threshold to avoid false result assignment.
+    if best is not None and best_score >= 0.86:
+        return best, "fuzzy", round(best_score, 4)
+
+    return None, None, 0.0
+
+
+def find_existing_match_for_row(row, matches):
+    """
+    Used when ingesting a source result. This prevents creating a duplicate
+    discovered result when we already have the same pre-match prediction.
+    """
+    best_idx = None
+    best_score = 0.0
+    rd = row_date_obj(row)
+
+    for idx, m in enumerate(matches):
+        if is_placeholder(m.get("player_a")) or is_placeholder(m.get("player_b")):
+            continue
+
+        ps = pair_similarity(
+            m.get("player_a"),
+            m.get("player_b"),
+            row.get("winner_name"),
+            row.get("loser_name"),
+        )
+        if ps < 0.87:
+            continue
+
+        ts = tournament_similarity(m.get("tournament"), tournament_name(row))
+        md = parse_iso_date(m.get("date"))
+
+        date_score = 0.5
+        if md and rd:
+            delta = abs((md - rd).days)
+            if delta <= 1:
+                date_score = 1.0
+            elif delta <= 7:
+                date_score = 0.85
+            elif delta <= 21:
+                date_score = 0.65
+            else:
+                date_score = 0.20
+
+        score = 0.72 * ps + 0.18 * ts + 0.10 * date_score
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_idx is not None and best_score >= 0.86:
+        return best_idx, round(best_score, 4)
+    return None, 0.0
+
+
 def main():
     matches = json.loads(MATCHES.read_text(encoding="utf-8"))
     rows, source_url = download_rows()
     today_ec = datetime.now(ECUADOR_TZ).date()
 
-    # 0) Canonicalize tournament names and REMOVE EVERY TBD/TBD placeholder.
+    # 0) Normalize and remove all TBD/TBD cards.
     cleaned = []
     removed_placeholders = 0
-
     for m in matches:
         m["tournament"] = canonical_tournament(m.get("tournament"))
-
         if is_placeholder(m.get("player_a")) and is_placeholder(m.get("player_b")):
             removed_placeholders += 1
             continue
-
         cleaned.append(m)
-
     matches = cleaned
 
-    # 1) Deduplicate aliases / repeated cards, preserving real predictions.
+    # 1) Exact deduplication.
     deduped = {}
     duplicates_removed = 0
-
     for m in matches:
         key = match_identity(m)
-
         if key not in deduped:
             deduped[key] = m
             continue
 
         current = deduped[key]
         if record_quality(m) > record_quality(current):
-            m = merge_records(m, current)
-            deduped[key] = m
+            deduped[key] = merge_records(m, current)
         else:
             deduped[key] = merge_records(current, m)
-
         duplicates_removed += 1
-
     matches = list(deduped.values())
 
-    # 2) Sync existing real matches using player pair + canonical tournament.
-    synced = 0
+    # 2) Sync already-tracked predictions/results.
+    synced_exact = 0
+    synced_fuzzy = 0
+    unmatched_old = 0
 
     for m in matches:
         if is_placeholder(m.get("player_a")) or is_placeholder(m.get("player_b")):
             continue
 
-        p = frozenset((norm(m["player_a"]), norm(m["player_b"])))
-
-        candidates = [
-            r for r in rows
-            if row_pair(r) == p
-            and same_tournament(tournament_name(r), m.get("tournament"))
-        ]
-
-        # Tournament feeds can use different round labels; round is a preference,
-        # not a hard requirement.
-        if m.get("round"):
-            same_round = [
-                r for r in candidates
-                if round_code(r) == str(m.get("round")).upper().strip()
-            ]
-            if same_round:
-                candidates = same_round
-
-        if not candidates:
+        row, method, score = find_best_result(m, rows)
+        if row is None:
+            # Only count stale/non-finished tracked cards for diagnostics.
+            if str(m.get("status") or "").lower() != "finished":
+                unmatched_old += 1
             continue
 
-        row = candidates[-1]
         state = make_state(m, row, source_url)
         old = m.get("live_state") or {}
 
@@ -407,31 +567,43 @@ def main():
             or old.get("winner") != state.get("winner")
             or old.get("sets") != state.get("sets")
         ):
-            apply_result(m, row, source_url)
-            synced += 1
+            apply_result(m, row, source_url, method)
+            m["result_match_score"] = score
+            if method == "exact":
+                synced_exact += 1
+            else:
+                synced_fuzzy += 1
 
-    # 3) Discover unseen finished ATP results.
-    existing = {match_identity(m) for m in matches}
+    # 3) Ingest source results, but first fuzzy-link them to an existing card.
     discovered = 0
+    linked_existing = 0
 
     for row in rows:
         if not row.get("winner_name") or not row.get("loser_name"):
             continue
 
-        candidate = discover_finished(row, source_url)
-        key = match_identity(candidate)
-
-        if key in existing:
+        idx, score = find_existing_match_for_row(row, matches)
+        if idx is not None:
+            m = matches[idx]
+            old = m.get("live_state") or {}
+            state = make_state(m, row, source_url)
+            if (
+                m.get("status") != "finished"
+                or old.get("winner") != state.get("winner")
+                or old.get("sets") != state.get("sets")
+            ):
+                apply_result(m, row, source_url, "source_link")
+                m["result_match_score"] = score
+                linked_existing += 1
             continue
 
+        # Truly unseen result.
+        candidate = discover_finished(row, source_url)
         matches.append(candidate)
-        existing.add(key)
         discovered += 1
 
-    # 4) A match whose date is already in the past must NOT remain "scheduled".
-    # Do not invent the result: mark it as waiting for source synchronization.
+    # 4) Mark stale scheduled cards correctly.
     pending_marked = 0
-
     for m in matches:
         status = str(m.get("status") or "").lower()
         d = parse_iso_date(m.get("date"))
@@ -444,10 +616,42 @@ def main():
             m["status"] = "pending_result"
             m["sync_warning"] = (
                 "El partido ya pasó, pero la fuente automática todavía no "
-                "ha confirmado el resultado."
+                "ha confirmado o enlazado el resultado."
             )
             m["last_sync_check"] = datetime.now(timezone.utc).isoformat()
             pending_marked += 1
+
+    # 5) Final fuzzy dedupe after ingestion.
+    # Do not aggressively merge unrelated same-surname players.
+    final = []
+    fuzzy_dupes = 0
+
+    for m in matches:
+        merged = False
+        for i, existing in enumerate(final):
+            ps = pair_similarity(
+                m.get("player_a"), m.get("player_b"),
+                existing.get("player_a"), existing.get("player_b")
+            )
+            ts = tournament_similarity(m.get("tournament"), existing.get("tournament"))
+            if ps >= 0.94 and ts >= 0.88:
+                md = parse_iso_date(m.get("date"))
+                ed = parse_iso_date(existing.get("date"))
+                date_close = True
+                if md and ed:
+                    date_close = abs((md - ed).days) <= 14
+                if date_close:
+                    if record_quality(m) > record_quality(existing):
+                        final[i] = merge_records(m, existing)
+                    else:
+                        final[i] = merge_records(existing, m)
+                    fuzzy_dupes += 1
+                    merged = True
+                    break
+        if not merged:
+            final.append(m)
+
+    matches = final
 
     matches.sort(
         key=lambda m: (
@@ -465,10 +669,14 @@ def main():
     )
 
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
-    print(f"Removed/merged {duplicates_removed} duplicate match cards.")
-    print(f"Synced {synced} tracked matches.")
-    print(f"Discovered {discovered} new ATP results.")
+    print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
+    print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
+    print(f"Synced {synced_exact} tracked matches by exact player names.")
+    print(f"Synced {synced_fuzzy} tracked matches by flexible name matching.")
+    print(f"Linked {linked_existing} source results to existing tracked cards.")
+    print(f"Discovered {discovered} truly new ATP results.")
     print(f"Marked {pending_marked} stale scheduled matches as pending_result.")
+    print(f"Unmatched stale/non-finished tracked cards: {unmatched_old}")
     print(f"Total tracked: {len(matches)}")
     print(f"Source: {source_url}")
 
