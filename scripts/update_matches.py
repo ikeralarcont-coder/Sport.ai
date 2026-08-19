@@ -19,6 +19,7 @@ ECUADOR_TZ = timezone(timedelta(hours=-5))
 SOURCES = [
     "https://stats.tennismylife.org/data/ongoing_tourneys.csv",
     "https://raw.githubusercontent.com/Tennismylife/TML-Database/master/ongoing_tourneys.csv",
+    "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2026.csv",
 ]
 
 PLACEHOLDER_NAMES = {
@@ -176,18 +177,45 @@ def parse_score(score):
 
 
 def download_rows():
-    last_error = None
+    """Combine all reachable free ATP result feeds."""
+    all_rows = []
+    used_sources = []
+    errors = []
+
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/6.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
+
             rows = list(csv.DictReader(io.StringIO(text)))
-            if rows:
-                return rows, url
+            if not rows:
+                continue
+
+            for row in rows:
+                row["_source_url"] = url
+                all_rows.append(row)
+
+            used_sources.append(url)
         except Exception as e:
-            last_error = e
-    raise RuntimeError(f"No ATP source available: {last_error}")
+            errors.append(f"{url}: {e}")
+
+    if not all_rows:
+        raise RuntimeError("No ATP source available: " + " | ".join(errors))
+
+    deduped = {}
+    for row in all_rows:
+        key = (
+            norm(row.get("winner_name")),
+            norm(row.get("loser_name")),
+            norm(row.get("tourney_name") or row.get("tournament") or row.get("tourney")),
+            str(row.get("round") or "").upper().strip(),
+            re.sub(r"\D", "", str(row.get("tourney_date") or row.get("date") or ""))[:8],
+        )
+        if key not in deduped:
+            deduped[key] = row
+
+    return list(deduped.values()), used_sources
 
 
 def row_pair(row):
@@ -510,9 +538,141 @@ def find_existing_match_for_row(row, matches):
     return None, 0.0
 
 
+
+def recovery_score(match, row):
+    """Specialized score for stale/pending matches."""
+    ps = pair_similarity(
+        match.get("player_a"),
+        match.get("player_b"),
+        row.get("winner_name"),
+        row.get("loser_name"),
+    )
+    if ps < 0.91:
+        return 0.0
+
+    ts = tournament_similarity(match.get("tournament"), tournament_name(row))
+    if ts < 0.60:
+        return 0.0
+
+    md = parse_iso_date(match.get("date"))
+    rd = row_date_obj(row)
+
+    date_score = 0.45
+    if md and rd:
+        delta = abs((md - rd).days)
+        if delta <= 1:
+            date_score = 1.0
+        elif delta <= 3:
+            date_score = 0.92
+        elif delta <= 7:
+            date_score = 0.80
+        elif delta <= 14:
+            date_score = 0.62
+        elif delta <= 30:
+            date_score = 0.35
+        else:
+            return 0.0
+
+    surface_bonus = 0.0
+    ms = norm(match.get("surface"))
+    rs = norm(row.get("surface"))
+    if ms and rs and ms == rs:
+        surface_bonus = 0.03
+
+    return (0.78 * ps) + (0.14 * ts) + (0.08 * date_score) + surface_bonus
+
+
+def recover_pending_results(matches, rows, default_source):
+    recovered = 0
+    unresolved = []
+
+    for m in matches:
+        status = str(m.get("status") or "").lower()
+        if status not in {"pending_result", "scheduled", "upcoming", "pre"}:
+            continue
+        if is_placeholder(m.get("player_a")) or is_placeholder(m.get("player_b")):
+            continue
+
+        best_row = None
+        best_score = 0.0
+
+        for row in rows:
+            score = recovery_score(m, row)
+            if score > best_score:
+                best_score = score
+                best_row = row
+
+        if best_row is not None and best_score >= 0.90:
+            row_source = best_row.get("_source_url") or default_source
+            apply_result(m, best_row, row_source, "pending_recovery")
+            m["result_match_score"] = round(best_score, 4)
+            m.pop("sync_warning", None)
+            m["recovered_from_pending"] = True
+            recovered += 1
+        else:
+            unresolved.append({
+                "match_id": m.get("match_id"),
+                "date": m.get("date"),
+                "tournament": m.get("tournament"),
+                "round": m.get("round"),
+                "player_a": m.get("player_a"),
+                "player_b": m.get("player_b"),
+                "status": status,
+                "best_score": round(best_score, 4),
+            })
+
+    return recovered, unresolved
+
+
+def dedupe_after_recovery(matches):
+    out = []
+    merged = 0
+
+    for m in matches:
+        found = None
+
+        for i, existing in enumerate(out):
+            ps = pair_similarity(
+                m.get("player_a"), m.get("player_b"),
+                existing.get("player_a"), existing.get("player_b"),
+            )
+            ts = tournament_similarity(m.get("tournament"), existing.get("tournament"))
+
+            md = parse_iso_date(m.get("date"))
+            ed = parse_iso_date(existing.get("date"))
+            close = True
+            if md and ed:
+                close = abs((md - ed).days) <= 14
+
+            if ps >= 0.97 and ts >= 0.88 and close:
+                found = i
+                break
+
+        if found is None:
+            out.append(m)
+            continue
+
+        existing = out[found]
+        m_pred = m.get("prediction_status") != "not_predicted_discovered"
+        e_pred = existing.get("prediction_status") != "not_predicted_discovered"
+
+        if m_pred and not e_pred:
+            out[found] = merge_records(m, existing)
+        elif e_pred and not m_pred:
+            out[found] = merge_records(existing, m)
+        elif record_quality(m) > record_quality(existing):
+            out[found] = merge_records(m, existing)
+        else:
+            out[found] = merge_records(existing, m)
+
+        merged += 1
+
+    return out, merged
+
 def main():
     matches = json.loads(MATCHES.read_text(encoding="utf-8"))
-    rows, source_url = download_rows()
+    rows, source_urls = download_rows()
+    source_url = source_urls[0] if source_urls else "unknown"
     today_ec = datetime.now(ECUADOR_TZ).date()
 
     # 0) Normalize and remove all TBD/TBD cards.
@@ -567,7 +727,7 @@ def main():
             or old.get("winner") != state.get("winner")
             or old.get("sets") != state.get("sets")
         ):
-            apply_result(m, row, source_url, method)
+            apply_result(m, row, row.get("_source_url") or source_url, method)
             m["result_match_score"] = score
             if method == "exact":
                 synced_exact += 1
@@ -592,13 +752,13 @@ def main():
                 or old.get("winner") != state.get("winner")
                 or old.get("sets") != state.get("sets")
             ):
-                apply_result(m, row, source_url, "source_link")
+                apply_result(m, row, row.get("_source_url") or source_url, "source_link")
                 m["result_match_score"] = score
                 linked_existing += 1
             continue
 
         # Truly unseen result.
-        candidate = discover_finished(row, source_url)
+        candidate = discover_finished(row, row.get("_source_url") or source_url)
         matches.append(candidate)
         discovered += 1
 
@@ -621,7 +781,13 @@ def main():
             m["last_sync_check"] = datetime.now(timezone.utc).isoformat()
             pending_marked += 1
 
-    # 5) Final fuzzy dedupe after ingestion.
+    # 5) V6 pending-result recovery.
+    recovered_pending, unresolved_pending = recover_pending_results(
+        matches, rows, source_url
+    )
+    matches, recovery_dupes = dedupe_after_recovery(matches)
+
+    # 6) Final fuzzy dedupe after ingestion.
     # Do not aggressively merge unrelated same-surname players.
     final = []
     fuzzy_dupes = 0
@@ -676,9 +842,25 @@ def main():
     print(f"Linked {linked_existing} source results to existing tracked cards.")
     print(f"Discovered {discovered} truly new ATP results.")
     print(f"Marked {pending_marked} stale scheduled matches as pending_result.")
-    print(f"Unmatched stale/non-finished tracked cards: {unmatched_old}")
+    print(f"Recovered {recovered_pending} pending/stale matches with V6 resolver.")
+    print(f"Removed/merged {recovery_dupes} result-only duplicates after recovery.")
+    print(f"Unmatched stale/non-finished tracked cards before recovery: {unmatched_old}")
+    print(f"Still unresolved after V6 recovery: {len(unresolved_pending)}")
+
+    if unresolved_pending:
+        print("----- UNRESOLVED MATCHES -----")
+        for item in unresolved_pending:
+            print(
+                f"[UNRESOLVED] {item['date']} | {item['tournament']} | "
+                f"{item['round']} | {item['player_a']} vs {item['player_b']} | "
+                f"status={item['status']} | best_score={item['best_score']}"
+            )
+        print("------------------------------")
+
     print(f"Total tracked: {len(matches)}")
-    print(f"Source: {source_url}")
+    print("Sources loaded:")
+    for loaded_source in source_urls:
+        print(f" - {loaded_source}")
 
 
 if __name__ == "__main__":
