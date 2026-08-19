@@ -17,6 +17,14 @@ main{max-width:1320px;margin:auto;padding:22px 20px 60px}.hero{display:flex;just
 .warn{border-color:#674326;background:#1b160d}.audit{border-color:#5c302a;background:#1a1110}.finalbox{border-color:#24553a;background:#0c1c13}.mut{color:var(--mut);font-size:12px}
 @media(max-width:920px){.grid{grid-template-columns:repeat(2,1fr)}.columns{grid-template-columns:1fr}}
 @media(max-width:620px){main{padding:14px}.nav{padding:12px 14px}.grid{grid-template-columns:1fr}.hero{display:block}.drawer{inset:auto 0 0;max-height:94vh;border-radius:24px 24px 0 0}.content{padding:14px}.stats{grid-template-columns:1fr 1fr}.cmp{grid-template-columns:66px 1fr 66px}}
+
+.datebar{max-width:900px;margin:0 auto 12px;display:flex;justify-content:center;align-items:center;gap:22px;padding:10px 16px}
+.datebar button{background:#15191f;border:1px solid #2b3139;color:#fff;border-radius:9px;width:38px;height:38px;font-size:22px;cursor:pointer}
+.datebar div{text-align:center;min-width:150px}.datebar small{display:block;color:#7f8996;font-size:10px;letter-spacing:1.2px}.datebar strong{font-size:14px}
+.match{padding:12px 16px!important;border-radius:10px!important;margin-bottom:7px}
+.match .meta{font-size:11px}.match .row{min-height:29px}.match .name{font-size:14px}.match .num{font-size:14px}
+.tourneyHead{padding:10px 4px 6px;margin-top:12px;color:#dfe6ee;font-size:12px;font-weight:800;letter-spacing:.4px}
+.tourneyHead span{color:#7f8996;font-weight:500;margin-left:7px}
 </style></head><body>
 <header><div class="nav"><div class="logo">SPORTS <i>AI</i> · TENNIS</div><div class="tag">AUTO · cada 10 min</div></div></header>
 <main><section class="hero"><div><h1>Entiende el partido,<br>no solo el porcentaje.</h1></div><p>Predicción, matchup, forma, torneo, fatiga, presión y señales que contradicen al favorito. Cada resultado queda auditado.</p></section>
@@ -46,7 +54,32 @@ function state(m){
   if(m.status==='pending_result') return 'pending';
   return 'next';
 }
-function render(){let a=M.filter(m=>filter==='all'||state(m)===filter);grid.innerHTML=a.map(card).join('')}
+let selectedDay=new Date().toISOString().slice(0,10);
+function fmtDay(d){
+  let x=new Date(d+"T12:00:00");
+  return x.toLocaleDateString('es-EC',{weekday:'short',day:'2-digit',month:'short'}).toUpperCase();
+}
+function shiftDay(n){
+  let d=new Date(selectedDay+"T12:00:00");d.setDate(d.getDate()+n);
+  selectedDay=d.toISOString().slice(0,10);render();
+}
+function render(){
+  let q=(search.value||'').toLowerCase();
+  let arr=M.filter(m=>{
+    let dateOK=(F==='pending'||F==='final'||F==='all')?true:m.date===selectedDay;
+    let stateOK=F==='all'||state(m)===F;
+    let queryOK=!q||JSON.stringify(m).toLowerCase().includes(q);
+    return dateOK&&stateOK&&queryOK;
+  });
+  selectedDate.textContent=selectedDay===new Date().toISOString().slice(0,10)?'HOY · '+fmtDay(selectedDay):fmtDay(selectedDay);
+  let groups={};
+  arr.forEach(m=>{let k=(m.tournament||'ATP')+'|'+(m.surface||'');(groups[k]??=[]).push(m)});
+  grid.innerHTML=Object.entries(groups).map(([k,ms])=>{
+    let [t,s]=k.split('|');
+    return `<div class="tourneyHead">${t}<span>${s||''}</span></div>`+ms.map(card).join('');
+  }).join('')||'<div class="empty">No hay partidos para esta fecha/filtro.</div>';
+}
+
 function card(m){
   let s=state(m),st=m.live_state,pa=m.player_a_probability??.5,pb=m.player_b_probability??.5;
   let badge=s==='final'?'FINAL':s==='pending'?'PENDIENTE':'PRÓXIMO';
