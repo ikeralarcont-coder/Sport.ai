@@ -17,8 +17,15 @@ MATCHES = ROOT / "matches.json"
 ECUADOR_TZ = timezone(timedelta(hours=-5))
 
 SOURCES = [
+    # Fast/current TML feeds.
     "https://stats.tennismylife.org/data/ongoing_tourneys.csv",
     "https://raw.githubusercontent.com/Tennismylife/TML-Database/master/ongoing_tourneys.csv",
+
+    # V7 season fallback: catches results that have already moved out of
+    # ongoing_tourneys.csv but are present in the current-season database.
+    "https://raw.githubusercontent.com/Tennismylife/TML-Database/master/2026.csv",
+
+    # Independent season fallback.
     "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_matches_2026.csv",
 ]
 
@@ -320,7 +327,7 @@ def make_state(match, row, source_url):
             "player_a": W if a_is_winner else L,
             "player_b": L if a_is_winner else W,
         },
-        "source_note": "TML ATP live database",
+        "source_note": "ATP multi-source database",
         "source_url": source_url,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -362,7 +369,7 @@ def discover_finished(row, source_url):
         "player_b": loser,
         "event_type": "Singles",
         "status": "finished",
-        "source": "TML ATP live database",
+        "source": "ATP multi-source database",
         "prediction_status": "not_predicted_discovered",
         "player_a_probability": 0.5,
         "player_b_probability": 0.5,
@@ -781,7 +788,7 @@ def main():
             m["last_sync_check"] = datetime.now(timezone.utc).isoformat()
             pending_marked += 1
 
-    # 5) V6 pending-result recovery.
+    # 5) V7 multi-source pending-result recovery.
     recovered_pending, unresolved_pending = recover_pending_results(
         matches, rows, source_url
     )
@@ -842,10 +849,10 @@ def main():
     print(f"Linked {linked_existing} source results to existing tracked cards.")
     print(f"Discovered {discovered} truly new ATP results.")
     print(f"Marked {pending_marked} stale scheduled matches as pending_result.")
-    print(f"Recovered {recovered_pending} pending/stale matches with V6 resolver.")
+    print(f"Recovered {recovered_pending} pending/stale matches with V7 multi-source resolver.")
     print(f"Removed/merged {recovery_dupes} result-only duplicates after recovery.")
     print(f"Unmatched stale/non-finished tracked cards before recovery: {unmatched_old}")
-    print(f"Still unresolved after V6 recovery: {len(unresolved_pending)}")
+    print(f"Still unresolved after V7 recovery: {len(unresolved_pending)}")
 
     if unresolved_pending:
         print("----- UNRESOLVED MATCHES -----")
