@@ -7,6 +7,11 @@ import json
 import re
 import unicodedata
 import urllib.request
+
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -191,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/14.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/15.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -850,7 +855,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/14.0"},
+            headers={"User-Agent": "SportsAI/15.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -1458,16 +1463,33 @@ def discover_fixtures_from_github(matches, rows, today_ec):
     return added, enriched, eligible, skipped_challenger, diagnostics
 
 def _http_json(url):
-    """Small browser-like JSON fetcher used by V11 fixture discovery."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 Chrome/142.0 Safari/537.36 SportsAI/14.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.sofascore.com/",
-        },
-    )
+    """V15 browser-impersonated JSON fetcher for providers protected by Cloudflare.
+
+    GitHub-hosted runners are frequently rejected by Sofascore when using
+    urllib alone. curl_cffi impersonates a real browser TLS/client fingerprint.
+    urllib remains a local fallback so the updater still runs if the optional
+    dependency is absent.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.sofascore.com/",
+        "Origin": "https://www.sofascore.com",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    if curl_requests is not None:
+        r = curl_requests.get(
+            url, headers=headers, timeout=25, impersonate="chrome"
+        )
+        r.raise_for_status()
+        return r.json()
+
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=25) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -1773,17 +1795,9 @@ def sofascore_rows_for_match(match, today_ec):
         if d > today_ec:
             continue
 
-        url = f"https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{d.isoformat()}"
+        url = f"https://www.sofascore.com/api/v1/sport/tennis/scheduled-events/{d.isoformat()}"
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 SportsAI/14.0",
-                    "Accept": "application/json",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = _http_json(url)
 
             used.append(url)
 
@@ -2169,7 +2183,7 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V14 DYNAMIC DAILY ATP DISCOVERY ===")
+    print("=== V15 SOFASCORE + DYNAMIC DAILY ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2186,9 +2200,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V11 Sofascore events seen today/tomorrow: {fixture_seen}")
-    print(f"V11 Sofascore fixtures added: {fixture_added}")
-    print(f"V11 Sofascore cards enriched: {fixture_enriched}")
+    print(f"V15 Sofascore events seen today/tomorrow: {fixture_seen}")
+    print(f"V15 Sofascore fixtures added: {fixture_added}")
+    print(f"V15 Sofascore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2241,7 +2255,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V11 Sofascore fixture-discovery diagnostics:")
+    print("V15 Sofascore fixture-discovery diagnostics:")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
