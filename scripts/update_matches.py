@@ -2930,6 +2930,11 @@ def main():
         encoding="utf-8",
     )
 
+    # V24: publish today's complete scoreboard snapshot to Cloudflare.
+    print("=== V24 CLOUDFLARE LIVE PUSH ===")
+    push_live_snapshot_to_cloudflare(matches, today_ec)
+    print("================================")
+
     print("=== V23 NAME NORMALIZATION ===")
     print(f"Provider player names normalized: {v19_names_changed}")
     for _change in v19_name_changes:
