@@ -48,22 +48,99 @@ main{max-width:900px;margin:auto;padding:22px 20px 60px}.hero{display:flex;justi
 <div id="bg" class="drawerbg"></div><aside id="drawer" class="drawer"><div class="dhead"><b>Análisis completo</b><button id="x" class="x">✕</button></div><div id="detail" class="content"></div></aside>
 <script>
 let M=[];let filter='next'; const pct=x=>(Number(x||0)*100).toFixed(1)+'%';
+
+// V25: GitHub Pages keeps the full prediction/history dataset.
+// Cloudflare supplies the fast live-state overlay pushed by GitHub Actions.
+const LIVE_API='https://sports-ai-live.ruth198027.workers.dev/live';
+
 async function fetchMatches(){
   const url='matches.json?v='+Date.now();
   const r=await fetch(url,{cache:'no-store',headers:{'Cache-Control':'no-cache'}});
   if(!r.ok) throw new Error('No se pudo actualizar matches.json');
   return r.json();
 }
-async function boot(){
-  M=await fetchMatches();
-  render();
-  setInterval(async()=>{
+
+async function fetchLive(){
+  const r=await fetch(LIVE_API+'?v='+Date.now(),{
+    cache:'no-store',
+    headers:{'Cache-Control':'no-cache'}
+  });
+  if(!r.ok) throw new Error('Cloudflare /live respondió '+r.status);
+  const data=await r.json();
+  if(!data?.ok || !Array.isArray(data.matches)) throw new Error('Respuesta /live inválida');
+  return data.matches;
+}
+
+function mergeLive(base,live){
+  const byId=new Map((live||[]).filter(x=>x?.match_id).map(x=>[String(x.match_id),x]));
+  const used=new Set();
+
+  const merged=(base||[]).map(m=>{
+    const l=byId.get(String(m.match_id));
+    if(!l) return m;
+    used.add(String(m.match_id));
+
+    // Live snapshot is newer for status/score fields, while the base object
+    // remains authoritative for the complete prediction/analysis payload.
+    return {
+      ...m,
+      ...l,
+      analysis:m.analysis||l.analysis,
+      written_analysis:m.written_analysis||l.written_analysis,
+      style_matchup:m.style_matchup||l.style_matchup,
+      tournament_performance:m.tournament_performance||l.tournament_performance,
+      live_state:l.live_state||m.live_state
+    };
+  });
+
+  // Safety: if a newly discovered match reaches Cloudflare before Pages has
+  // published the newest matches.json, show it immediately instead of hiding it.
+  (live||[]).forEach(l=>{
+    if(l?.match_id && !used.has(String(l.match_id))) merged.push(l);
+  });
+  return merged;
+}
+
+async function refreshLive(){
+  try{
+    const live=await fetchLive();
+    M=mergeLive(M,live);
+    render();
+  }catch(e){
+    console.warn('Live API fallback:',e);
+  }
+}
+
+async function refreshBase(){
+  try{
+    const base=await fetchMatches();
     try{
-      const fresh=await fetchMatches();
-      M=fresh;
-      render();
-    }catch(e){console.warn('Auto-refresh:',e)}
-  },60000);
+      const live=await fetchLive();
+      M=mergeLive(base,live);
+    }catch(e){
+      M=base;
+      console.warn('Cloudflare no disponible; usando matches.json:',e);
+    }
+    render();
+  }catch(e){
+    console.warn('Base refresh:',e);
+  }
+}
+
+async function boot(){
+  const base=await fetchMatches();
+  try{
+    M=mergeLive(base,await fetchLive());
+  }catch(e){
+    M=base;
+    console.warn('Inicio con matches.json:',e);
+  }
+  render();
+
+  // Cloudflare is lightweight, so poll it frequently for score/status changes.
+  setInterval(refreshLive,15000);
+  // Re-read the full GitHub Pages dataset less often for new predictions/cards.
+  setInterval(refreshBase,60000);
 }
 function state(m){
   if(m.status==='finished') return 'final';
