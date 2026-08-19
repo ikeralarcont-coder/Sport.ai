@@ -196,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/19.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/20.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -898,7 +898,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/19.0"},
+            headers={"User-Agent": "SportsAI/20.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -2298,11 +2298,19 @@ def _find_card_for_external_event(event, matches, rows):
 
 def _flashscore_apply_status(match, event):
     """
-    Update one Sports AI card from Flashscore without destroying its prediction.
+    V20: update Sports AI card from Flashscore, including live scoreboard data.
+
+    Keeps the pre-match prediction intact while updating:
+      scheduled -> live -> finished
+      set score
+      current game score when provided
+      last live sync timestamp
     """
     code = str(event.get("status_code") or "")
     sa = event.get("score_a")
     sb = event.get("score_b")
+    ga = event.get("game_a")
+    gb = event.get("game_b")
 
     match["flashscore_event_id"] = event.get("event_id")
     match["flashscore_source_url"] = event.get("source_url")
@@ -2312,10 +2320,26 @@ def _flashscore_apply_status(match, event):
     if event.get("surface") and norm(event.get("surface")) != "unknown":
         match["surface"] = event["surface"]
 
-    match["last_live_sync"] = datetime.now(timezone.utc).isoformat()
+    sync_time = datetime.now(timezone.utc).isoformat()
+    match["last_live_sync"] = sync_time
+
+    live = match.get("live_state") or {}
+    live.update({
+        "player_a": match.get("player_a"),
+        "player_b": match.get("player_b"),
+        "set_score": [sa, sb] if sa is not None and sb is not None else live.get("set_score", []),
+        "current_game": {
+            "player_a": ga,
+            "player_b": gb,
+        } if ga is not None or gb is not None else live.get("current_game"),
+        "source_note": "Flashscore live feed",
+        "source_url": event.get("source_url"),
+        "synced_at": sync_time,
+    })
 
     if code == "3":
         match["status"] = "finished"
+        live["status"] = "finished"
 
         winner = None
         if sa is not None and sb is not None:
@@ -2324,23 +2348,14 @@ def _flashscore_apply_status(match, event):
             elif sb > sa:
                 winner = event.get("player_b")
 
-        live = match.get("live_state") or {}
-        live.update({
-            "status": "finished",
-            "player_a": match.get("player_a"),
-            "player_b": match.get("player_b"),
-            "set_score": [sa, sb] if sa is not None and sb is not None else live.get("set_score", []),
-            "winner": winner or live.get("winner"),
-            "source_note": "Flashscore live feed",
-            "source_url": event.get("source_url"),
-            "synced_at": datetime.now(timezone.utc).isoformat(),
-        })
+        live["winner"] = winner or live.get("winner")
         match["live_state"] = live
 
         if winner:
             match["result_winner"] = winner
-            match["result_synced_at"] = datetime.now(timezone.utc).isoformat()
+            match["result_synced_at"] = sync_time
             match["result_match_method"] = "flashscore_pair_date"
+
             if match.get("prediction_status") != "not_predicted_discovered":
                 predicted = (
                     match.get("player_a")
@@ -2356,16 +2371,7 @@ def _flashscore_apply_status(match, event):
 
     if code == "2":
         match["status"] = "live"
-        live = match.get("live_state") or {}
-        live.update({
-            "status": "live",
-            "player_a": match.get("player_a"),
-            "player_b": match.get("player_b"),
-            "set_score": [sa, sb] if sa is not None and sb is not None else live.get("set_score", []),
-            "source_note": "Flashscore live feed",
-            "source_url": event.get("source_url"),
-            "synced_at": datetime.now(timezone.utc).isoformat(),
-        })
+        live["status"] = "live"
         match["live_state"] = live
         return "live"
 
@@ -2374,8 +2380,9 @@ def _flashscore_apply_status(match, event):
         "", "scheduled", "upcoming", "pre", "pending_result"
     }:
         match["status"] = "scheduled"
-    return "scheduled"
 
+    match["live_state"] = live if live else match.get("live_state")
+    return "scheduled"
 
 def flashscore_card_from_event(event):
     dt = event.get("datetime_ec")
@@ -2718,13 +2725,13 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V19 NAME NORMALIZATION ===")
+    print("=== V20 NAME NORMALIZATION ===")
     print(f"Provider player names normalized: {v19_names_changed}")
     for _change in v19_name_changes:
         print(f" - {_change}")
     print("==============================")
 
-    print("=== V19 FLASHSCORE FEED ===")
+    print("=== V20 FLASHSCORE LIVE FEED ===")
     print(f"Relevant ATP rows (D-2..D+1): {fs_stats['relevant']}")
     print(f"Cards added from Flashscore: {fs_stats['added']}")
     print(f"Existing cards enriched from Flashscore: {fs_stats['enriched']}")
@@ -2735,12 +2742,12 @@ def main():
     print("===========================")
 
     audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
-    print("=== V19 GITHUB SOURCE ROW AUDIT ===")
+    print("=== V20 GITHUB SOURCE ROW AUDIT ===")
     print(f"Raw top-level ATP rows: {len(audit_rows)}")
     for i, a in enumerate(audit_rows, 1):
         print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
     print("============================")
-    print("=== V19 MULTI-SOURCE ATP DISCOVERY ===")
+    print("=== V20 MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2762,8 +2769,8 @@ def main():
     _finished = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "finished")
 
     print(f"Final unique scheduled/live fixtures today: {len(v14_today_cards)}")
-    print(f"V19 total unique matches today (all statuses): {len(v18_today_all)}")
-    print(f"V19 status split: scheduled={_scheduled} | live={_live} | finished={_finished}")
+    print(f"V20 total unique matches today (all statuses): {len(v18_today_all)}")
+    print(f"V20 status split: scheduled={_scheduled} | live={_live} | finished={_finished}")
     for i, m in enumerate(v14_today_cards, 1):
         print(f"[TODAY {i}] {m.get('tournament')} | {m.get('player_a')} vs {m.get('player_b')} | status={m.get('status')} | prediction={m.get('prediction_status') or 'existing'}")
     if v14_alias_log:
@@ -2776,9 +2783,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V19 SofaScore events seen today/tomorrow: {fixture_seen}")
-    print(f"V19 SofaScore fixtures added: {fixture_added}")
-    print(f"V19 SofaScore cards enriched: {fixture_enriched}")
+    print(f"V20 SofaScore events seen today/tomorrow: {fixture_seen}")
+    print(f"V20 SofaScore fixtures added: {fixture_added}")
+    print(f"V20 SofaScore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2831,7 +2838,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V19 SofaScore diagnostics (non-blocking):")
+    print("V20 SofaScore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
