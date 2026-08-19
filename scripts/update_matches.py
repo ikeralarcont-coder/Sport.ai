@@ -196,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/15.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/16.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -855,7 +855,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/15.0"},
+            headers={"User-Agent": "SportsAI/16.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -1381,6 +1381,33 @@ def github_fixture_card(item, today_ec, known_names):
 
     return card
 
+
+
+def audit_github_fixture_feed(rows, today_ec):
+    """V16: show every top-level ATP source row before matching/deduplication."""
+    payload, diagnostics = download_github_fixture_feed()
+    items = payload.get("matches") or []
+    known_names = historical_player_names(rows)
+    audit = []
+    for item in items:
+        if norm(item.get("tour")) != "atp":
+            continue
+        tn = norm(item.get("tournament") or "")
+        if any(x in tn for x in ("challenger", "qualification", "qualifying")):
+            continue
+        p1 = expand_fixture_player_name(item.get("player1"), known_names)
+        p2 = expand_fixture_player_name(item.get("player2"), known_names)
+        if not p1 or not p2 or is_placeholder(p1) or is_placeholder(p2):
+            continue
+        audit.append({
+            "player_a": p1, "player_b": p2,
+            "raw_a": clean_fixture_player_name(item.get("player1")),
+            "raw_b": clean_fixture_player_name(item.get("player2")),
+            "tournament": canonical_tournament(item.get("tournament") or "ATP Tournament"),
+            "time": str(item.get("time") or "").strip() or None,
+            "identity": canonical_pair_key(p1, p2, known_names),
+        })
+    return audit, diagnostics
 
 def discover_fixtures_from_github(matches, rows, today_ec):
     """
@@ -2183,7 +2210,13 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V15 SOFASCORE + DYNAMIC DAILY ATP DISCOVERY ===")
+    audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
+    print("=== V16 SOURCE ROW AUDIT ===")
+    print(f"Raw top-level ATP rows: {len(audit_rows)}")
+    for i, a in enumerate(audit_rows, 1):
+        print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
+    print("============================")
+    print("=== V16 MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2200,9 +2233,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V15 Sofascore events seen today/tomorrow: {fixture_seen}")
-    print(f"V15 Sofascore fixtures added: {fixture_added}")
-    print(f"V15 Sofascore cards enriched: {fixture_enriched}")
+    print(f"V16 optional Sofascore events seen today/tomorrow: {fixture_seen}")
+    print(f"V16 optional Sofascore fixtures added: {fixture_added}")
+    print(f"V16 optional Sofascore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2255,7 +2288,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V15 Sofascore fixture-discovery diagnostics:")
+    print("V16 optional Sofascore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
