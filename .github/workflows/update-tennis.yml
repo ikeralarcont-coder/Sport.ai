@@ -1,1 +1,44 @@
+name: Update tennis results
 
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tennis-results-update
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Update completed matches
+        run: python scripts/update_matches.py
+
+      - name: Commit changes if results changed
+        run: |
+          if git diff --quiet -- matches.json; then
+            echo "No new completed results."
+            exit 0
+          fi
+
+          git config user.name "sports-ai-bot"
+          git config user.email "sports-ai-bot@users.noreply.github.com"
+
+          git add matches.json
+          git commit -m "Auto-update tennis results"
+          git push
