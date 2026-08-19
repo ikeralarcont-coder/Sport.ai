@@ -2161,6 +2161,9 @@ def main():
         reverse=True,
     )
 
+    # V14 final dynamic report (computed after all cleanup/recovery).
+    v14_today_cards = daily_fixture_report(matches, today_ec, rows)
+
     MATCHES.write_text(
         json.dumps(matches, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
