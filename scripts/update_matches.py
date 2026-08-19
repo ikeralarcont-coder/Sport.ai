@@ -2238,6 +2238,14 @@ def fetch_flashscore_atp_feed(day_offsets=(-2, -1, 0, 1)):
                 },
                 "score_a": as_int(fields.get("AG")),
                 "score_b": as_int(fields.get("AH")),
+                # V25: Flashscore stores tennis set/game breakdown in paired
+                # score fields (BA/BB, BC/BD, ...). Keep every populated pair
+                # so the frontend can show 6-4, 3-2 plus the point score.
+                "sets": [
+                    {"a": as_int(fields.get(a_key)), "b": as_int(fields.get(b_key))}
+                    for a_key, b_key in (("BA","BB"),("BC","BD"),("BE","BF"),("BG","BH"),("BI","BJ"))
+                    if as_int(fields.get(a_key)) is not None and as_int(fields.get(b_key)) is not None
+                ],
                 "game_a": fields.get("GRA"),
                 "game_b": fields.get("GRB"),
                 "timestamp": ts,
@@ -2369,6 +2377,8 @@ def _flashscore_apply_status(match, event):
         "player_a": match.get("player_a"),
         "player_b": match.get("player_b"),
         "set_score": [sa, sb] if sa is not None and sb is not None else live.get("set_score", []),
+        "sets": event.get("sets") or live.get("sets", []),
+        "current_set": (event.get("sets") or live.get("sets") or [None])[-1],
         "current_game": {
             "player_a": ga,
             "player_b": gb,
@@ -2684,6 +2694,8 @@ def push_live_snapshot_to_cloudflare(matches, today_ec):
             "player_b": m.get("player_b"),
             "status": status,
             "set_score": set_score,
+            "sets": live.get("sets") or [],
+            "current_set": live.get("current_set"),
             "current_game": current_game,
             "interrupted": bool(live.get("interrupted")) or status in {
                 "interrupted", "suspended", "delayed", "postponed"
