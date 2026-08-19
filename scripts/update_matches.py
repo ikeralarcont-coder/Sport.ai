@@ -196,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/16.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/17.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -855,7 +855,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/16.0"},
+            headers={"User-Agent": "SportsAI/17.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -1478,7 +1478,7 @@ def discover_fixtures_from_github(matches, rows, today_ec):
                 if card.get(key) is not None:
                     existing[key] = card[key]
 
-            if str(existing.get("status") or "").lower() in {"scheduled", "upcoming", "pre"}:
+            if str(existing.get("status") or "").lower() in {"scheduled", "upcoming", "pre", ""}:
                 existing["status"] = "scheduled"
 
             existing["fixture_match_score"] = round(best_score, 4)
@@ -2014,13 +2014,417 @@ def dedupe_after_recovery(matches):
 
     return out, merged
 
+
+# ---------------------------------------------------------------------------
+# V17: Flashscore live-feed connector
+# ---------------------------------------------------------------------------
+
+FS_FEED_TEMPLATE = "https://www.flashscore.com/x/feed/f_2_{day}_2_en-gb_1"
+FS_HEADERS = {
+    "x-fsign": "SW9D1eZo",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.flashscore.com/",
+    "Origin": "https://www.flashscore.com",
+    "Accept": "*/*",
+    "Accept-Language": "en-GB,en;q=0.9",
+}
+FS_FIELD_SEP = chr(0xAC)  # ¬
+FS_KV_SEP = chr(0xF7)     # ÷
+
+
+def _flashscore_get_text(url):
+    """Fetch Flashscore text feed; curl_cffi first, urllib fallback."""
+    if curl_requests is not None:
+        r = curl_requests.get(
+            url,
+            headers=FS_HEADERS,
+            timeout=25,
+            impersonate="chrome",
+        )
+        r.raise_for_status()
+        return r.text
+
+    req = urllib.request.Request(url, headers=FS_HEADERS)
+    with urllib.request.urlopen(req, timeout=25) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _fs_parse_section(section):
+    fields = {}
+    for part in section.split(FS_FIELD_SEP):
+        if FS_KV_SEP in part:
+            key, _, value = part.partition(FS_KV_SEP)
+            fields[key] = value
+    return fields
+
+
+def _fs_tournament_name(header):
+    """
+    Convert Flashscore labels such as:
+      ATP Cincinnati (USA), hard - singles
+    to the canonical Sports AI tournament name.
+    """
+    s = str(header or "").strip()
+    n = norm(s)
+
+    if "cincinnati" in n:
+        return "Cincinnati Open"
+    if "us open" in n:
+        return "US Open"
+    if "wimbledon" in n:
+        return "Wimbledon"
+    if "roland garros" in n or "french open" in n:
+        return "Roland Garros"
+
+    # Generic cleanup for future ATP events.
+    s = re.sub(r"(?i)^\s*ATP\s+", "", s)
+    s = re.sub(r"(?i)\s*-\s*singles.*$", "", s)
+    s = re.sub(r"\s*,\s*(hard|clay|grass|indoor|indoors).*$", "", s, flags=re.I)
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,-")
+    return canonical_tournament(s or header)
+
+
+def _fs_surface(header):
+    n = norm(header)
+    if "hard" in n:
+        return "Hard"
+    if "clay" in n:
+        return "Clay"
+    if "grass" in n:
+        return "Grass"
+    if "indoor" in n:
+        return "Indoor"
+    return "Unknown"
+
+
+def fetch_flashscore_atp_feed(day_offsets=(-2, -1, 0, 1)):
+    """
+    Download ATP singles feeds for yesterday/recent/today/tomorrow.
+
+    AB status mapping used by Flashscore feed:
+      1 = scheduled
+      2 = live
+      3 = finished
+    """
+    events = []
+    diagnostics = []
+
+    for offset in day_offsets:
+        url = FS_FEED_TEMPLATE.format(day=offset)
+        try:
+            raw = _flashscore_get_text(url)
+            diagnostics.append(f"OK::{url}::bytes={len(raw)}")
+        except Exception as e:
+            diagnostics.append(
+                f"ERROR::{url}::{type(e).__name__}: {e}"
+            )
+            continue
+
+        current_tournament = ""
+        current_surface = ""
+        current_is_atp_singles = False
+
+        for section in raw.split("~"):
+            fields = _fs_parse_section(section)
+
+            if "ZA" in fields:
+                current_tournament = fields.get("ZA", "")
+                low = norm(current_tournament)
+                current_is_atp_singles = (
+                    "atp" in low
+                    and "singles" in low
+                    and "wta" not in low
+                    and "doubles" not in low
+                    and "double" not in low
+                )
+                current_surface = _fs_surface(current_tournament)
+                continue
+
+            if not current_is_atp_singles:
+                continue
+            if "AA" not in fields:
+                continue
+
+            p1 = str(fields.get("AE") or "").strip()
+            p2 = str(fields.get("AF") or "").strip()
+            if not p1 or not p2 or is_placeholder(p1) or is_placeholder(p2):
+                continue
+
+            try:
+                ts = int(fields.get("AD", 0) or 0)
+            except Exception:
+                ts = 0
+
+            dt_ec = (
+                datetime.fromtimestamp(ts, timezone.utc).astimezone(ECUADOR_TZ)
+                if ts else None
+            )
+
+            events.append({
+                "event_id": fields.get("AA"),
+                "player_a": p1,
+                "player_b": p2,
+                "status_code": str(fields.get("AB") or ""),
+                "score_a": as_int(fields.get("AG")),
+                "score_b": as_int(fields.get("AH")),
+                "game_a": fields.get("GRA"),
+                "game_b": fields.get("GRB"),
+                "timestamp": ts,
+                "datetime_ec": dt_ec,
+                "date_ec": dt_ec.date() if dt_ec else None,
+                "time_ec": dt_ec.strftime("%H:%M") if dt_ec else None,
+                "tournament": _fs_tournament_name(current_tournament),
+                "surface": current_surface,
+                "raw_tournament": current_tournament,
+                "source_url": url,
+            })
+
+    # Event-id dedupe; keep the later feed observation.
+    unique = {}
+    for event in events:
+        key = event.get("event_id") or (
+            event.get("date_ec"),
+            canonical_pair_key(event.get("player_a"), event.get("player_b")),
+            tournament_key(event.get("tournament")),
+        )
+        unique[key] = event
+
+    return list(unique.values()), diagnostics
+
+
+def _find_card_for_external_event(event, matches, rows):
+    known = historical_player_names(rows)
+    event_pair = canonical_pair_key(
+        event.get("player_a"), event.get("player_b"), known
+    )
+    event_date = event.get("date_ec")
+    best_idx = None
+    best_score = 0.0
+
+    for idx, m in enumerate(matches):
+        pair = canonical_pair_key(
+            m.get("player_a"), m.get("player_b"), known
+        )
+        if not all(pair) or pair != event_pair:
+            continue
+
+        ts = tournament_similarity(
+            event.get("tournament"), m.get("tournament")
+        )
+        md = parse_iso_date(m.get("date"))
+
+        if event_date and md:
+            delta = abs((event_date - md).days)
+            if delta == 0:
+                ds = 1.0
+            elif delta == 1:
+                ds = 0.90
+            elif delta <= 3:
+                ds = 0.65
+            else:
+                continue
+        else:
+            ds = 0.50
+
+        score = 0.82 + 0.12 * ts + 0.06 * ds
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+
+    return best_idx, round(best_score, 4)
+
+
+def _flashscore_apply_status(match, event):
+    """
+    Update one Sports AI card from Flashscore without destroying its prediction.
+    """
+    code = str(event.get("status_code") or "")
+    sa = event.get("score_a")
+    sb = event.get("score_b")
+
+    match["flashscore_event_id"] = event.get("event_id")
+    match["flashscore_source_url"] = event.get("source_url")
+    match["time_ecuador"] = event.get("time_ec") or match.get("time_ecuador")
+    match["timezone"] = "America/Guayaquil"
+
+    if event.get("surface") and norm(event.get("surface")) != "unknown":
+        match["surface"] = event["surface"]
+
+    match["last_live_sync"] = datetime.now(timezone.utc).isoformat()
+
+    if code == "3":
+        match["status"] = "finished"
+
+        winner = None
+        if sa is not None and sb is not None:
+            if sa > sb:
+                winner = event.get("player_a")
+            elif sb > sa:
+                winner = event.get("player_b")
+
+        live = match.get("live_state") or {}
+        live.update({
+            "status": "finished",
+            "player_a": match.get("player_a"),
+            "player_b": match.get("player_b"),
+            "set_score": [sa, sb] if sa is not None and sb is not None else live.get("set_score", []),
+            "winner": winner or live.get("winner"),
+            "source_note": "Flashscore live feed",
+            "source_url": event.get("source_url"),
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        })
+        match["live_state"] = live
+
+        if winner:
+            match["result_winner"] = winner
+            match["result_synced_at"] = datetime.now(timezone.utc).isoformat()
+            match["result_match_method"] = "flashscore_pair_date"
+            if match.get("prediction_status") != "not_predicted_discovered":
+                predicted = (
+                    match.get("player_a")
+                    if float(match.get("player_a_probability", 0.5)) >= 0.5
+                    else match.get("player_b")
+                )
+                match["prediction_correct"] = (
+                    player_similarity(predicted, winner) >= 0.88
+                )
+
+        match.pop("sync_warning", None)
+        return "finished"
+
+    if code == "2":
+        match["status"] = "live"
+        live = match.get("live_state") or {}
+        live.update({
+            "status": "live",
+            "player_a": match.get("player_a"),
+            "player_b": match.get("player_b"),
+            "set_score": [sa, sb] if sa is not None and sb is not None else live.get("set_score", []),
+            "source_note": "Flashscore live feed",
+            "source_url": event.get("source_url"),
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        })
+        match["live_state"] = live
+        return "live"
+
+    # Not started.
+    if str(match.get("status") or "").lower() in {
+        "", "scheduled", "upcoming", "pre", "pending_result"
+    }:
+        match["status"] = "scheduled"
+    return "scheduled"
+
+
+def flashscore_card_from_event(event):
+    dt = event.get("datetime_ec")
+    return {
+        "match_id": f"FS-{event.get('event_id')}",
+        "date": (
+            event.get("date_ec").isoformat()
+            if event.get("date_ec")
+            else datetime.now(ECUADOR_TZ).date().isoformat()
+        ),
+        "time_ecuador": event.get("time_ec"),
+        "timezone": "America/Guayaquil",
+        "tournament": event.get("tournament") or "ATP Tournament",
+        "tournament_level": "ATP",
+        "surface": event.get("surface") or "Unknown",
+        "round": "",
+        "player_a": event.get("player_a"),
+        "player_b": event.get("player_b"),
+        "event_type": "Singles",
+        "status": "scheduled",
+        "source": "Flashscore live feed",
+        "flashscore_event_id": event.get("event_id"),
+        "flashscore_source_url": event.get("source_url"),
+        "fixture_discovered_automatically": True,
+        "fixture_discovered_at": datetime.now(timezone.utc).isoformat(),
+        "prediction_status": "awaiting_prediction",
+        "player_a_probability": 0.5,
+        "player_b_probability": 0.5,
+    }
+
+
+def merge_flashscore_feed(matches, rows, today_ec):
+    """
+    Use Flashscore as an independent source for:
+      - today's complete ATP singles fixture list
+      - live state
+      - finished result state
+      - recent stale-result recovery
+
+    No fixed expected daily match count.
+    """
+    events, diagnostics = fetch_flashscore_atp_feed()
+    added = 0
+    enriched = 0
+    live_updated = 0
+    finished_updated = 0
+    relevant = 0
+
+    # Keep only a compact date window around Ecuador today.
+    min_day = today_ec - timedelta(days=2)
+    max_day = today_ec + timedelta(days=1)
+
+    for event in events:
+        d = event.get("date_ec")
+        if d is None or not (min_day <= d <= max_day):
+            continue
+
+        # Exclude obvious lower-tour rows if provider labels them ATP.
+        tn = norm(event.get("raw_tournament") or event.get("tournament"))
+        if any(x in tn for x in ("challenger", "qualification", "qualifying")):
+            continue
+
+        relevant += 1
+
+        idx, score = _find_card_for_external_event(event, matches, rows)
+        if idx is None:
+            card = flashscore_card_from_event(event)
+            _flashscore_apply_status(card, event)
+            matches.append(card)
+            added += 1
+            if card.get("status") == "live":
+                live_updated += 1
+            elif card.get("status") == "finished":
+                finished_updated += 1
+            continue
+
+        m = matches[idx]
+        before = str(m.get("status") or "")
+        after = _flashscore_apply_status(m, event)
+        m["flashscore_match_score"] = score
+        enriched += 1
+
+        if after == "live" and before != "live":
+            live_updated += 1
+        if after == "finished" and before != "finished":
+            finished_updated += 1
+
+    return {
+        "relevant": relevant,
+        "added": added,
+        "enriched": enriched,
+        "live_updated": live_updated,
+        "finished_updated": finished_updated,
+        "diagnostics": diagnostics,
+    }
+
 def main():
     matches = json.loads(MATCHES.read_text(encoding="utf-8"))
     rows, source_urls = download_rows()
     source_url = source_urls[0] if source_urls else "unknown"
     today_ec = datetime.now(ECUADOR_TZ).date()
 
-    # V12: GitHub-hosted daily fixture discovery (no API key / no Sofascore 403).
+    # V17: independent Flashscore feed first. It can add missing fixtures and
+    # promote existing cards scheduled -> live -> finished.
+    fs_stats = merge_flashscore_feed(matches, rows, today_ec)
+
+    # V12: GitHub-hosted daily fixture discovery remains as a second source.
     gh_fixture_added, gh_fixture_enriched, gh_fixture_eligible, gh_fixture_skipped_ch, gh_fixture_diagnostics = (
         discover_fixtures_from_github(matches, rows, today_ec)
     )
@@ -2210,13 +2614,23 @@ def main():
         encoding="utf-8",
     )
 
+    print("=== V17 FLASHSCORE FEED ===")
+    print(f"Relevant ATP rows (D-2..D+1): {fs_stats['relevant']}")
+    print(f"Cards added from Flashscore: {fs_stats['added']}")
+    print(f"Existing cards enriched from Flashscore: {fs_stats['enriched']}")
+    print(f"Promoted to LIVE: {fs_stats['live_updated']}")
+    print(f"Promoted to FINISHED: {fs_stats['finished_updated']}")
+    for diagnostic in fs_stats["diagnostics"]:
+        print(f" - {diagnostic}")
+    print("===========================")
+
     audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
-    print("=== V16 SOURCE ROW AUDIT ===")
+    print("=== V17 GITHUB SOURCE ROW AUDIT ===")
     print(f"Raw top-level ATP rows: {len(audit_rows)}")
     for i, a in enumerate(audit_rows, 1):
         print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
     print("============================")
-    print("=== V16 MULTI-SOURCE ATP DISCOVERY ===")
+    print("=== V17 FLASHCORE + MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
@@ -2233,9 +2647,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V16 optional Sofascore events seen today/tomorrow: {fixture_seen}")
-    print(f"V16 optional Sofascore fixtures added: {fixture_added}")
-    print(f"V16 optional Sofascore cards enriched: {fixture_enriched}")
+    print(f"V17 optional Sofascore events seen today/tomorrow: {fixture_seen}")
+    print(f"V17 optional Sofascore fixtures added: {fixture_added}")
+    print(f"V17 optional Sofascore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2249,7 +2663,7 @@ def main():
     print(f"Skipped {skipped_not_stale} scheduled matches that are today/future (not stale).")
     print(f"Removed/merged {recovery_dupes} result-only duplicates after recovery.")
     print(f"Unmatched stale/non-finished tracked cards before recovery: {unmatched_old}")
-    print(f"Still unresolved after V11 recovery: {len(unresolved_pending)}")
+    print(f"Still unresolved after all recovery: {len(unresolved_pending)}")
 
     if unresolved_pending:
         print("----- UNRESOLVED MATCHES -----")
@@ -2288,7 +2702,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V16 optional Sofascore diagnostics (non-blocking):")
+    print("V17 optional Sofascore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
