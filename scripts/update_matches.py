@@ -196,7 +196,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/17.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/18.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -789,62 +789,105 @@ def historical_player_names(rows):
 
 def expand_fixture_player_name(raw_name, known_names):
     """
-    Convert abbreviated feed names such as "Cobolli F." to the most likely
-    full player name from our ATP result database.
+    V18 name resolver for provider abbreviations.
 
-    If the mapping is ambiguous, keep the source name instead of guessing.
+    Supports examples such as:
+      Fritz T.               -> Taylor Fritz
+      Tiafoe F.              -> Frances Tiafoe
+      Tirante T. A.          -> Thiago Agustin Tirante
+      De Minaur A.           -> Alex de Minaur
+      Auger-Aliassime F.     -> Felix Auger-Aliassime
+
+    If resolution is ambiguous, keep the source name rather than guessing.
     """
     raw = clean_fixture_player_name(raw_name)
     if not raw:
         return raw
 
-    # Already full-looking.
-    parts = norm(raw).split()
-    if len(parts) >= 2 and len(parts[-1]) > 1 and "." not in raw:
+    nraw = norm(raw)
+    parts = nraw.split()
+    if not parts:
         return raw
 
-    # TennisExplorer commonly uses "Surname F.".
-    m = re.match(r"^(.*?)\s+([A-Za-z])\.$", raw)
-    if not m:
+    # Already looks like a full normal name: "Taylor Fritz".
+    if "." not in raw and all(len(p) > 1 for p in parts):
         return raw
 
-    surname_raw = norm(m.group(1))
-    initial = m.group(2).lower()
+    # Provider format is normally:
+    #   Surname [SurnamePart ...] I. [I. ...]
+    # Find the first single-letter token; everything before it is surname.
+    first_initial_idx = None
+    for i, p in enumerate(parts):
+        if len(p) == 1:
+            first_initial_idx = i
+            break
+
+    # Also support front-initial notation such as "T. Fritz".
+    if first_initial_idx == 0:
+        initials = []
+        i = 0
+        while i < len(parts) and len(parts[i]) == 1:
+            initials.append(parts[i])
+            i += 1
+        surname_parts = parts[i:]
+        orientation = "front"
+    elif first_initial_idx is not None:
+        surname_parts = parts[:first_initial_idx]
+        initials = [p for p in parts[first_initial_idx:] if len(p) == 1]
+        orientation = "back"
+    else:
+        return raw
+
+    if not surname_parts or not initials:
+        return raw
+
+    surname_raw = " ".join(surname_parts)
 
     candidates = []
     for full in known_names:
-        full_parts = norm(full).split()
-        if not full_parts:
+        fparts = norm(full).split()
+        if len(fparts) < 2:
             continue
-        full_surname = full_parts[-1]
-        full_initial = full_parts[0][0] if full_parts[0] else ""
 
-        # Multi-token surnames: "De Minaur A." should match Alex de Minaur.
-        normalized_full = norm(full)
-        surname_match = (
-            full_surname == surname_raw
-            or normalized_full.endswith(" " + surname_raw)
-            or surname_raw in normalized_full
-        )
+        # Historical rows are generally "First Middle Surname".
+        full_initials = [p[0] for p in fparts[:-1] if p]
+        full_surname_1 = fparts[-1]
+        full_surname_2 = " ".join(fparts[-2:]) if len(fparts) >= 3 else full_surname_1
+        full_surname_3 = " ".join(fparts[-3:]) if len(fparts) >= 4 else full_surname_2
 
-        if surname_match and full_initial == initial:
+        surname_match = surname_raw in {
+            full_surname_1, full_surname_2, full_surname_3
+        }
+
+        # Also tolerate hyphen/particle normalization through compact text.
+        if not surname_match:
+            surname_match = compact(surname_raw) in {
+                compact(full_surname_1),
+                compact(full_surname_2),
+                compact(full_surname_3),
+            }
+
+        if not surname_match:
+            continue
+
+        # All provider initials must agree, in order, with given-name initials.
+        if len(full_initials) >= len(initials) and full_initials[:len(initials)] == initials:
             candidates.append(full)
 
     if len(candidates) == 1:
         return candidates[0]
 
-    # Score ambiguous candidates and only accept a clearly superior result.
+    # Conservative scoring if several historical players share surname/initials.
     scored = []
     for full in candidates:
-        score = player_similarity(raw, full)
-        scored.append((score, full))
+        seq = SequenceMatcher(None, compact(raw), compact(full)).ratio()
+        scored.append((seq, full))
     scored.sort(reverse=True)
 
     if scored and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
         return scored[0][1]
 
     return raw
-
 
 def download_github_fixture_feed():
     """
@@ -855,7 +898,7 @@ def download_github_fixture_feed():
     try:
         req = urllib.request.Request(
             GITHUB_FIXTURE_FEED,
-            headers={"User-Agent": "SportsAI/17.0"},
+            headers={"User-Agent": "SportsAI/18.0"},
         )
         with urllib.request.urlopen(req, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -1227,30 +1270,45 @@ def enrich_fixture_with_provisional_analysis(match, rows, today_ec):
 
 def canonical_player_identity(name, known_names=None):
     raw = clean_fixture_player_name(name)
+    if known_names:
+        raw = expand_fixture_player_name(raw, known_names)
+
     n = norm(raw)
     if not n:
         return ""
-    if known_names:
-        expanded = expand_fixture_player_name(raw, known_names)
-        if expanded and norm(expanded) != n:
-            raw, n = expanded, norm(expanded)
-    parts = [p for p in n.split() if p]
+
+    parts = n.split()
     if not parts:
         return ""
-    if len(parts[0]) == 1:
-        initial, surname_parts = parts[0], parts[1:]
-    elif len(parts[-1]) == 1:
-        initial, surname_parts = parts[-1], parts[:-1]
-    else:
+
+    # Full name: first given-name initial + normalized surname.
+    if all(len(p) > 1 for p in parts):
         initial = parts[0][0]
-        particles={"de","del","van","von","da","dos","di","la","le"}
-        if len(parts)>=3 and parts[-2] in particles:
-            surname_parts=parts[-2:]
-        elif len(parts)>=3 and parts[-3] in particles:
-            surname_parts=parts[-3:]
+        particles = {"de","del","van","von","da","dos","di","la","le"}
+        if len(parts) >= 3 and parts[-2] in particles:
+            surname_parts = parts[-2:]
+        elif len(parts) >= 4 and parts[-3] in particles:
+            surname_parts = parts[-3:]
         else:
-            surname_parts=parts[-1:]
-    return f"{''.join(surname_parts)}:{initial}"
+            surname_parts = parts[-1:]
+        return f"{''.join(surname_parts)}:{initial}"
+
+    # Provider surname-first abbreviation, e.g. Tirante T. A.
+    first_single = next((i for i,p in enumerate(parts) if len(p)==1), None)
+    if first_single is not None and first_single > 0:
+        surname_parts = parts[:first_single]
+        initials = [p for p in parts[first_single:] if len(p)==1]
+        return f"{''.join(surname_parts)}:{''.join(initials)}"
+
+    # Initial-first abbreviation, e.g. T. Fritz
+    singles = []
+    i = 0
+    while i < len(parts) and len(parts[i]) == 1:
+        singles.append(parts[i]); i += 1
+    if singles and i < len(parts):
+        return f"{''.join(parts[i:])}:{''.join(singles)}"
+
+    return compact(raw)
 
 def canonical_pair_key(a,b,known_names=None):
     return tuple(sorted((canonical_player_identity(a,known_names),
@@ -2614,7 +2672,7 @@ def main():
         encoding="utf-8",
     )
 
-    print("=== V17 FLASHSCORE FEED ===")
+    print("=== V18 FLASHSCORE FEED ===")
     print(f"Relevant ATP rows (D-2..D+1): {fs_stats['relevant']}")
     print(f"Cards added from Flashscore: {fs_stats['added']}")
     print(f"Existing cards enriched from Flashscore: {fs_stats['enriched']}")
@@ -2625,16 +2683,35 @@ def main():
     print("===========================")
 
     audit_rows, _audit_diag = audit_github_fixture_feed(rows, today_ec)
-    print("=== V17 GITHUB SOURCE ROW AUDIT ===")
+    print("=== V18 GITHUB SOURCE ROW AUDIT ===")
     print(f"Raw top-level ATP rows: {len(audit_rows)}")
     for i, a in enumerate(audit_rows, 1):
         print(f"[SOURCE {i}] {a['tournament']} | {a['raw_a']} vs {a['raw_b']} | expanded={a['player_a']} vs {a['player_b']} | identity={a['identity']} | time={a['time']}")
     print("============================")
-    print("=== V17 FLASHCORE + MULTI-SOURCE ATP DISCOVERY ===")
+    print("=== V18 MULTI-SOURCE ATP DISCOVERY ===")
     print(f"Date Ecuador: {today_ec.isoformat()}")
     print(f"Source ATP fixtures eligible: {gh_fixture_eligible}")
     print(f"Canonical alias duplicates merged: {v14_alias_dupes}")
+    v18_today_all = []
+    _v18_seen = set()
+    _v18_known = historical_player_names(rows)
+    for _m in matches:
+        if parse_iso_date(_m.get("date")) != today_ec:
+            continue
+        _pair = canonical_pair_key(_m.get("player_a"), _m.get("player_b"), _v18_known)
+        _key = (norm(canonical_tournament(_m.get("tournament"))), _pair)
+        if _key in _v18_seen:
+            continue
+        _v18_seen.add(_key)
+        v18_today_all.append(_m)
+
+    _scheduled = sum(1 for x in v18_today_all if str(x.get("status")).lower() in {"scheduled","upcoming","pre"})
+    _live = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "live")
+    _finished = sum(1 for x in v18_today_all if str(x.get("status")).lower() == "finished")
+
     print(f"Final unique scheduled/live fixtures today: {len(v14_today_cards)}")
+    print(f"V18 total unique matches today (all statuses): {len(v18_today_all)}")
+    print(f"V18 status split: scheduled={_scheduled} | live={_live} | finished={_finished}")
     for i, m in enumerate(v14_today_cards, 1):
         print(f"[TODAY {i}] {m.get('tournament')} | {m.get('player_a')} vs {m.get('player_b')} | status={m.get('status')} | prediction={m.get('prediction_status') or 'existing'}")
     if v14_alias_log:
@@ -2647,9 +2724,9 @@ def main():
     print(f"V12 GitHub scheduled fixtures added: {gh_fixture_added}")
     print(f"V12 GitHub existing cards enriched: {gh_fixture_enriched}")
     print(f"V12 GitHub Challenger/qualifying rows skipped: {gh_fixture_skipped_ch}")
-    print(f"V17 optional Sofascore events seen today/tomorrow: {fixture_seen}")
-    print(f"V17 optional Sofascore fixtures added: {fixture_added}")
-    print(f"V17 optional Sofascore cards enriched: {fixture_enriched}")
+    print(f"V18 optional Sofascore events seen today/tomorrow: {fixture_seen}")
+    print(f"V18 optional Sofascore fixtures added: {fixture_added}")
+    print(f"V18 optional Sofascore cards enriched: {fixture_enriched}")
     print(f"Removed {removed_placeholders} TBD/TBD placeholders.")
     print(f"Removed/merged {duplicates_removed} exact duplicate match cards.")
     print(f"Removed/merged {fuzzy_dupes} fuzzy duplicate match cards.")
@@ -2702,7 +2779,7 @@ def main():
     for diagnostic in gh_fixture_diagnostics:
         print(f" - {diagnostic}")
 
-    print("V17 optional Sofascore diagnostics (non-blocking):")
+    print("V18 optional Sofascore diagnostics (non-blocking):")
     for diagnostic in fixture_diagnostics:
         print(f" - {diagnostic}")
 
