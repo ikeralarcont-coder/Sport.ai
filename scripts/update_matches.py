@@ -191,7 +191,7 @@ def download_rows():
 
     for url in SOURCES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/6.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "SportsAI/8.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read().decode("utf-8-sig")
 
@@ -546,25 +546,112 @@ def find_existing_match_for_row(row, matches):
 
 
 
+
+def oriented_pair_similarity(match, row):
+    """Compare both A/B orientations and keep the stronger one."""
+    a = match.get("player_a")
+    b = match.get("player_b")
+    w = row.get("winner_name")
+    l = row.get("loser_name")
+
+    direct_a = player_similarity(a, w)
+    direct_b = player_similarity(b, l)
+    swap_a = player_similarity(a, l)
+    swap_b = player_similarity(b, w)
+
+    direct = (direct_a + direct_b) / 2
+    swapped = (swap_a + swap_b) / 2
+
+    if direct >= swapped:
+        return {
+            "orientation": "direct",
+            "pair_score": direct,
+            "player_a_score": direct_a,
+            "player_b_score": direct_b,
+        }
+
+    return {
+        "orientation": "swapped",
+        "pair_score": swapped,
+        "player_a_score": swap_a,
+        "player_b_score": swap_b,
+    }
+
+
+def pair_debug_summary(match, rows):
+    """
+    Search the loaded feeds by player identity first, without blocking on
+    tournament/date. Used only for diagnostics when a stale result is missing.
+    """
+    a_hits = 0
+    b_hits = 0
+    candidates = []
+
+    for row in rows:
+        a_best = max(
+            player_similarity(match.get("player_a"), row.get("winner_name")),
+            player_similarity(match.get("player_a"), row.get("loser_name")),
+        )
+        b_best = max(
+            player_similarity(match.get("player_b"), row.get("winner_name")),
+            player_similarity(match.get("player_b"), row.get("loser_name")),
+        )
+
+        if a_best >= 0.88:
+            a_hits += 1
+        if b_best >= 0.88:
+            b_hits += 1
+
+        oriented = oriented_pair_similarity(match, row)
+        if (
+            oriented["player_a_score"] >= 0.88
+            and oriented["player_b_score"] >= 0.88
+            and oriented["pair_score"] >= 0.90
+        ):
+            candidates.append((row, oriented))
+
+    candidates.sort(key=lambda x: x[1]["pair_score"], reverse=True)
+
+    best = None
+    if candidates:
+        row, oriented = candidates[0]
+        best = {
+            "winner": row.get("winner_name"),
+            "loser": row.get("loser_name"),
+            "date": row_date(row),
+            "tournament": tournament_name(row),
+            "round": round_code(row),
+            "surface": row.get("surface"),
+            "score": row.get("score"),
+            "pair_score": round(oriented["pair_score"], 4),
+            "orientation": oriented["orientation"],
+            "source": row.get("_source_url"),
+        }
+
+    return {
+        "player_a_hits": a_hits,
+        "player_b_hits": b_hits,
+        "pair_candidates": len(candidates),
+        "best_pair_candidate": best,
+    }
+
 def recovery_score(match, row):
-    """Specialized score for stale/pending matches."""
-    ps = pair_similarity(
-        match.get("player_a"),
-        match.get("player_b"),
-        row.get("winner_name"),
-        row.get("loser_name"),
-    )
-    if ps < 0.91:
+    """V8 pair-first stale-result score."""
+    oriented = oriented_pair_similarity(match, row)
+
+    if (
+        oriented["player_a_score"] < 0.88
+        or oriented["player_b_score"] < 0.88
+        or oriented["pair_score"] < 0.90
+    ):
         return 0.0
 
     ts = tournament_similarity(match.get("tournament"), tournament_name(row))
-    if ts < 0.60:
-        return 0.0
 
     md = parse_iso_date(match.get("date"))
     rd = row_date_obj(row)
 
-    date_score = 0.45
+    date_score = 0.40
     if md and rd:
         delta = abs((md - rd).days)
         if delta <= 1:
@@ -580,24 +667,53 @@ def recovery_score(match, row):
         else:
             return 0.0
 
-    surface_bonus = 0.0
+    surface_score = 0.5
     ms = norm(match.get("surface"))
     rs = norm(row.get("surface"))
-    if ms and rs and ms == rs:
-        surface_bonus = 0.03
+    if ms and rs:
+        surface_score = 1.0 if ms == rs else 0.0
 
-    return (0.78 * ps) + (0.14 * ts) + (0.08 * date_score) + surface_bonus
+    round_score = 0.5
+    mr = str(match.get("round") or "").upper().strip()
+    rr = round_code(row)
+    if mr and rr:
+        round_score = 1.0 if mr == rr else 0.35
 
+    return (
+        0.72 * oriented["pair_score"]
+        + 0.12 * ts
+        + 0.10 * date_score
+        + 0.04 * surface_score
+        + 0.02 * round_score
+    )
 
-def recover_pending_results(matches, rows, default_source):
+def recover_pending_results(matches, rows, default_source, today_ec):
+    """
+    Recover only genuinely stale matches.
+
+    Today's/future scheduled matches are NOT errors and are excluded from the
+    unresolved count. pending_result remains eligible immediately.
+    """
     recovered = 0
     unresolved = []
+    skipped_not_stale = 0
 
     for m in matches:
         status = str(m.get("status") or "").lower()
         if status not in {"pending_result", "scheduled", "upcoming", "pre"}:
             continue
         if is_placeholder(m.get("player_a")) or is_placeholder(m.get("player_b")):
+            continue
+
+        d = parse_iso_date(m.get("date"))
+        stale = status == "pending_result" or (
+            status in {"scheduled", "upcoming", "pre"}
+            and d is not None
+            and d < today_ec
+        )
+
+        if not stale:
+            skipped_not_stale += 1
             continue
 
         best_row = None
@@ -609,10 +725,13 @@ def recover_pending_results(matches, rows, default_source):
                 best_score = score
                 best_row = row
 
-        if best_row is not None and best_score >= 0.90:
+        debug = pair_debug_summary(m, rows)
+
+        if best_row is not None and best_score >= 0.88:
             row_source = best_row.get("_source_url") or default_source
-            apply_result(m, best_row, row_source, "pending_recovery")
+            apply_result(m, best_row, row_source, "pending_recovery_v8")
             m["result_match_score"] = round(best_score, 4)
+            m["result_pair_debug"] = debug
             m.pop("sync_warning", None)
             m["recovered_from_pending"] = True
             recovered += 1
@@ -626,10 +745,10 @@ def recover_pending_results(matches, rows, default_source):
                 "player_b": m.get("player_b"),
                 "status": status,
                 "best_score": round(best_score, 4),
+                "debug": debug,
             })
 
-    return recovered, unresolved
-
+    return recovered, unresolved, skipped_not_stale
 
 def dedupe_after_recovery(matches):
     out = []
@@ -788,9 +907,9 @@ def main():
             m["last_sync_check"] = datetime.now(timezone.utc).isoformat()
             pending_marked += 1
 
-    # 5) V7 multi-source pending-result recovery.
-    recovered_pending, unresolved_pending = recover_pending_results(
-        matches, rows, source_url
+    # 5) V8 pair-first multi-source pending-result recovery.
+    recovered_pending, unresolved_pending, skipped_not_stale = recover_pending_results(
+        matches, rows, source_url, today_ec
     )
     matches, recovery_dupes = dedupe_after_recovery(matches)
 
@@ -849,19 +968,34 @@ def main():
     print(f"Linked {linked_existing} source results to existing tracked cards.")
     print(f"Discovered {discovered} truly new ATP results.")
     print(f"Marked {pending_marked} stale scheduled matches as pending_result.")
-    print(f"Recovered {recovered_pending} pending/stale matches with V7 multi-source resolver.")
+    print(f"Recovered {recovered_pending} pending/stale matches with V8 pair-first multi-source resolver.")
+    print(f"Skipped {skipped_not_stale} scheduled matches that are today/future (not stale).")
     print(f"Removed/merged {recovery_dupes} result-only duplicates after recovery.")
     print(f"Unmatched stale/non-finished tracked cards before recovery: {unmatched_old}")
-    print(f"Still unresolved after V7 recovery: {len(unresolved_pending)}")
+    print(f"Still unresolved after V8 recovery: {len(unresolved_pending)}")
 
     if unresolved_pending:
         print("----- UNRESOLVED MATCHES -----")
         for item in unresolved_pending:
+            dbg = item["debug"]
             print(
                 f"[UNRESOLVED] {item['date']} | {item['tournament']} | "
                 f"{item['round']} | {item['player_a']} vs {item['player_b']} | "
-                f"status={item['status']} | best_score={item['best_score']}"
+                f"status={item['status']} | recovery_score={item['best_score']} | "
+                f"A_hits={dbg['player_a_hits']} | B_hits={dbg['player_b_hits']} | "
+                f"pair_candidates={dbg['pair_candidates']}"
             )
+            best = dbg.get("best_pair_candidate")
+            if best:
+                print(
+                    "  [BEST PAIR] "
+                    f"{best['winner']} vs {best['loser']} | "
+                    f"{best['date']} | {best['tournament']} | {best['round']} | "
+                    f"pair_score={best['pair_score']} | orientation={best['orientation']} | "
+                    f"score={best['score']} | source={best['source']}"
+                )
+            else:
+                print("  [BEST PAIR] none found in loaded sources")
         print("------------------------------")
 
     print(f"Total tracked: {len(matches)}")
